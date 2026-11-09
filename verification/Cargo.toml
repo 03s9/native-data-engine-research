@@ -1,0 +1,10 @@
+[package]
+name = "adversarial_systems_harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+rayon = "1.10"
+crossbeam-channel = "0.5"
+rand = "0.8"
