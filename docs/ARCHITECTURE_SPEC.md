@@ -300,6 +300,9 @@ pub trait PipelineBreaker: Send + Sync {
     fn consume(&self, thread_id: usize, morsel: RecordBatch) -> Result<(), EngineError>;
     fn seal(&self) -> Result<(), EngineError>;
     fn drain_partition(&self, partition_id: usize) -> Result<Option<RecordBatch>, EngineError>;
+
+    /// Proactive spill trigger hook called when MemoryReservation::requires_spill is true.
+    fn check_spill(&self, tracker: &MemoryBudgetTracker) -> Result<(), EngineError>;
 }
 ```
 
@@ -307,32 +310,118 @@ pub trait PipelineBreaker: Send + Sync {
 
 ```rust
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use crossbeam_channel::{Receiver, TryRecvError, RecvTimeoutError};
 
-pub struct MorselDispatcher {
+/// Common trait for morsel sources (both pre-materialized vectors and streaming I/O channels).
+pub trait MorselDispatcher: Send + Sync {
+    /// Claims the next batch. Returns `None` when the input stream is fully drained or terminated.
+    fn claim(&self) -> Option<RecordBatch>;
+
+    /// Signals early pipeline termination (e.g. on error or LIMIT completion).
+    fn terminate(&self);
+}
+
+/// Static in-memory morsel dispatcher for cached datasets and unit benchmarks.
+pub struct StaticMorselDispatcher {
     batches: Vec<RecordBatch>,
     cursor: AtomicUsize,
     total: usize,
+    terminated: AtomicBool,
 }
 
-impl MorselDispatcher {
+impl StaticMorselDispatcher {
     pub fn new(batches: Vec<RecordBatch>) -> Self {
         let total = batches.len();
         Self {
             batches,
             cursor: AtomicUsize::new(0),
             total,
+            terminated: AtomicBool::new(false),
         }
     }
+}
 
+impl MorselDispatcher for StaticMorselDispatcher {
     #[inline]
-    pub fn claim(&self) -> Option<RecordBatch> {
+    fn claim(&self) -> Option<RecordBatch> {
+        if self.terminated.load(Ordering::Relaxed) {
+            return None;
+        }
         let idx = self.cursor.fetch_add(1, Ordering::Relaxed);
         if idx < self.total {
             Some(self.batches[idx].clone()) // Zero-copy clone of Arc<RecordBatch> metadata
         } else {
             None
         }
+    }
+
+    fn terminate(&self) {
+        self.terminated.store(true, Ordering::Release);
+    }
+}
+
+/// Dynamic streaming morsel dispatcher consuming batches directly from a Tokio I/O channel.
+///
+/// NON-BLOCKING INVARIANT:
+/// Rayon worker threads must NEVER block on channel waits. If the channel is temporarily empty,
+/// workers execute a low-overhead spin-hint, cooperatively yield to Rayon (`rayon::yield_now()`),
+/// and use a micro-timeout (100 µs) to prevent CPU starvation and thermal throttling while
+/// allowing the Rayon scheduler to run other concurrent tasks.
+pub struct StreamingMorselDispatcher {
+    rx: Receiver<RecordBatch>,
+    terminated: AtomicBool,
+}
+
+impl StreamingMorselDispatcher {
+    pub fn new(rx: Receiver<RecordBatch>) -> Self {
+        Self {
+            rx,
+            terminated: AtomicBool::new(false),
+        }
+    }
+}
+
+impl MorselDispatcher for StreamingMorselDispatcher {
+    #[inline]
+    fn claim(&self) -> Option<RecordBatch> {
+        let mut spins = 0usize;
+        loop {
+            if self.terminated.load(Ordering::Acquire) {
+                return None;
+            }
+
+            match self.rx.try_recv() {
+                Ok(batch) => return Some(batch),
+                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Empty) => {
+                    if spins < 16 {
+                        std::hint::spin_loop();
+                        spins += 1;
+                    } else if spins < 32 {
+                        rayon::yield_now();
+                        spins += 1;
+                    } else {
+                        // Cooperative yield back to Rayon work-stealing scheduler
+                        rayon::yield_now();
+                        // Micro-timeout bounded sleep (100 µs) to prevent burning CPU
+                        match self.rx.recv_timeout(Duration::from_micros(100)) {
+                            Ok(batch) => return Some(batch),
+                            Err(RecvTimeoutError::Disconnected) => return None,
+                            Err(RecvTimeoutError::Timeout) => {
+                                spins = 16; // Continue cooperative yielding
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn terminate(&self) {
+        self.terminated.store(true, Ordering::Release);
     }
 }
 
@@ -350,13 +439,13 @@ impl RayonMorselEngine {
         Self { thread_pool: Arc::new(pool) }
     }
 
-    pub fn run_pipeline(
+    pub fn run_pipeline<D: MorselDispatcher + ?Sized>(
         &self,
-        dispatcher: Arc<MorselDispatcher>,
+        dispatcher: Arc<D>,
         operators: Arc<Vec<Box<dyn MorselOperator>>>,
         sink: Arc<dyn PipelineBreaker>,
     ) -> Result<(), EngineError> {
-        self.thread_pool.install(|| {
+        let result = self.thread_pool.install(|| {
             (0..self.thread_pool.current_num_threads())
                 .into_par_iter()
                 .try_for_each(|thread_id| -> Result<(), EngineError> {
@@ -372,6 +461,7 @@ impl RayonMorselEngine {
                                     break;
                                 }
                                 OperatorStatus::Finished => {
+                                    dispatcher.terminate();
                                     return Ok(());
                                 }
                             }
@@ -382,7 +472,12 @@ impl RayonMorselEngine {
                     }
                     Ok(())
                 })
-        })?;
+        });
+
+        if let Err(e) = result {
+            dispatcher.terminate();
+            return Err(e);
+        }
 
         sink.seal()?;
         Ok(())
@@ -483,21 +578,64 @@ Variable-length strings are represented conforming to the official Apache Arrow 
 pub struct StringViewDescriptor {
     pub len: u32,
     pub prefix: [u8; 4],
-    /// If len <= 12: payload holds the remaining 8 bytes inlined.
-    /// If len > 12: payload holds buffer_index (bytes 0..4) and buffer_offset (bytes 4..8).
+    /// If len <= 12: payload holds the remaining inlined bytes (offset 8..16).
+    /// If len > 12: payload holds buffer_index: u32 (offset 8..12) and buffer_offset: u32 (offset 12..16).
     pub payload: [u8; 8],
 }
 
 impl StringViewDescriptor {
+    /// Constructs a descriptor for an inlined string (len <= 12).
+    pub fn new_inlined(bytes: &[u8]) -> Self {
+        assert!(bytes.len() <= 12, "Inlined string length must be <= 12 bytes");
+        let mut prefix = [0u8; 4];
+        let mut payload = [0u8; 8];
+        let prefix_len = bytes.len().min(4);
+        prefix[..prefix_len].copy_from_slice(&bytes[..prefix_len]);
+        if bytes.len() > 4 {
+            payload[..bytes.len() - 4].copy_from_slice(&bytes[4..]);
+        }
+        Self {
+            len: bytes.len() as u32,
+            prefix,
+            payload,
+        }
+    }
+
+    /// Constructs a descriptor for an out-of-line string referencing a buffer pool.
+    pub fn new_out_of_line(len: u32, prefix: [u8; 4], buffer_index: u32, buffer_offset: u32) -> Self {
+        assert!(len > 12, "Out-of-line strings must have length > 12 bytes");
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&buffer_index.to_le_bytes());
+        payload[4..8].copy_from_slice(&buffer_offset.to_le_bytes());
+        Self { len, prefix, payload }
+    }
+
     #[inline(always)]
     pub fn is_inlined(&self) -> bool {
         self.len <= 12
     }
 
+    /// Returns a slice over the inlined string data.
+    ///
+    /// For len <= 12, the string is stored contiguously across `prefix` (bytes 4..8)
+    /// and `payload` (bytes 8..16).
     #[inline(always)]
     pub fn inline_data(&self) -> &[u8] {
-        debug_assert!(self.is_inlined());
-        &self.payload[0..(self.len as usize).saturating_sub(4)]
+        debug_assert!(self.is_inlined(), "Cannot extract inline data from out-of-line StringView");
+
+        // SAFETY:
+        // 1. Layout: StringViewDescriptor is #[repr(C, align(16))]. Field `len` occupies bytes 0..4,
+        //    `prefix` occupies bytes 4..8, and `payload` occupies bytes 8..16. There is zero padding.
+        // 2. Provenance: The raw pointer is derived from `self as *const Self as *const u8`, granting
+        //    provenance over the full 16-byte allocation of `Self`.
+        // 3. Bounds: Adding offset 4 points to the beginning of `prefix`. Since `self.len <= 12`,
+        //    the slice range [4, 4 + len) lies strictly within the 16-byte struct boundary [0, 16).
+        // 4. Lifetime & Aliasing: The returned slice borrows `&self` immutably for lifetime `'a`.
+        //    All 16 bytes of `Self` are fully initialized on construction.
+        unsafe {
+            let base_ptr = (self as *const Self as *const u8).add(4);
+            std::slice::from_raw_parts(base_ptr, self.len as usize)
+        }
     }
 
     #[inline(always)]
@@ -512,9 +650,18 @@ impl StringViewDescriptor {
         u32::from_le_bytes(self.payload[4..8].try_into().unwrap())
     }
 
+    /// Fast 64-bit comparison: checks length and 4-byte prefix simultaneously in a single CPU instruction.
     #[inline(always)]
     pub fn fast_equality_check(&self, target_len: u32, target_prefix: [u8; 4]) -> bool {
-        // Single 64-bit comparison: checks len (32 bits) and prefix (32 bits) simultaneously
+        // SAFETY:
+        // 1. Alignment: `StringViewDescriptor` is declared `#[repr(C, align(16))]`. Any valid reference
+        //    `&self` is 16-byte aligned, which strictly satisfies the 8-byte alignment requirement for `u64`.
+        // 2. Size & Bounds: The struct is 16 bytes; reading an 8-byte word from offset 0 accesses bytes 0..8
+        //    (spanning `len` at bytes 0..4 and `prefix` at bytes 4..8), remaining strictly within bounds.
+        // 3. Initialization: Bytes 0..8 are guaranteed to be fully initialized upon construction.
+        // 4. Endianness: On little-endian architectures (AArch64 and x86_64), `len: u32` occupies the
+        //    least-significant 32 bits and `prefix: [u8; 4]` occupies the most-significant 32 bits,
+        //    matching the bitwise combination `target_word`.
         let self_word = unsafe { *(self as *const Self as *const u64) };
         let target_word = (target_len as u64) | ((u32::from_ne_bytes(target_prefix) as u64) << 32);
         self_word == target_word
@@ -526,27 +673,131 @@ impl StringViewDescriptor {
 Rather than decompressing and materializing all columns at scan time (Early-Materialization), the engine uses a **Cascading Late-Materialization Gate**:
 1. Scan only the predicate columns ($C_{pred}$).
 2. Generate a compact Selection Representation:
-   - Dense SIMD Bitmap (`arrow::buffer::BooleanBuffer`) if selectivity $\sigma > 0.05$.
+   - Dense SIMD Bitmap (`arrow::buffer::BooleanBuffer`) if selectivity $\sigma \in (0.05, 0.15)$.
    - Sparse Index Vector (`&[u32]`) if selectivity $\sigma \le 0.05$.
 3. Evaluate subsequent predicates on the surviving subset.
 4. Materialize payload columns ($C_{payload}$) only for the surviving rows via vectorized `gather` / `take` kernels.
 
+#### Selectivity Inversion Guard ($\sigma_{crossover} = 0.15$)
+While late-materialization saves up to 97.02% bandwidth for highly selective queries ($\sigma \le 0.05$), it incurs two non-trivial overheads:
+1. DRAM allocation of intermediate selection bitmaps and index vectors.
+2. Non-contiguous, cache-line-inefficient gather operations ($B_{gather} \approx 120\text{ GB/s}$ vs $B_{seq} \approx 400\text{ GB/s}$).
+
+Solving the analytical cost model $T_{late}(N, \sigma) \le T_{early}(N, \sigma)$ establishes:
+$$\sigma_{crossover} \approx 0.15 \quad (15\%)$$
+When $\sigma \ge 0.15$, the gather and buffer allocation penalty exceeds the bandwidth saved from skipping unselected rows. Under this condition, the optimizer enforces **Early Single-Pass Fused Scan**, bypassing late-materialization entirely.
+
 ```rust
+use std::sync::Arc;
 use arrow::array::{Array, BooleanArray, UInt32Array};
 use arrow::compute::take;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializationStrategy {
+    /// Highly selective queries (sigma <= 0.05): materialize payload only via sparse row index vector
+    LateSparseIndices,
+    /// Moderately selective queries (0.05 < sigma < 0.15): materialize payload via dense SIMD bitmask
+    LateDenseBitmap,
+    /// Low selectivity / unselective queries (sigma >= 0.15): fused single-pass scan bypassing late materialization
+    EarlySinglePassScan,
+}
+
+pub struct MaterializationOptimizer {
+    pub crossover_sparse: f64, // 0.05
+    pub crossover_dense: f64,  // 0.15
+}
+
+impl Default for MaterializationOptimizer {
+    fn default() -> Self {
+        Self {
+            crossover_sparse: 0.05,
+            crossover_dense: 0.15,
+        }
+    }
+}
+
+impl MaterializationOptimizer {
+    /// Static plan-time optimizer selection based on catalog statistics
+    pub fn select_strategy(&self, estimated_selectivity: f64) -> MaterializationStrategy {
+        if estimated_selectivity <= self.crossover_sparse {
+            MaterializationStrategy::LateSparseIndices
+        } else if estimated_selectivity < self.crossover_dense {
+            MaterializationStrategy::LateDenseBitmap
+        } else {
+            MaterializationStrategy::EarlySinglePassScan
+        }
+    }
+}
+
+/// Runtime adaptive execution guard monitoring empirical morsel selectivity
+pub struct AdaptiveScanPipeline {
+    strategy: MaterializationStrategy,
+    morsels_evaluated: usize,
+    sample_morsel_limit: usize,
+    accumulated_tuples: usize,
+    accumulated_matches: usize,
+    optimizer: MaterializationOptimizer,
+}
+
+impl AdaptiveScanPipeline {
+    pub fn new(initial_strategy: MaterializationStrategy) -> Self {
+        Self {
+            strategy: initial_strategy,
+            morsels_evaluated: 0,
+            sample_morsel_limit: 4, // Sample first 4 morsels (~8,192 tuples)
+            accumulated_tuples: 0,
+            accumulated_matches: 0,
+            optimizer: MaterializationOptimizer::default(),
+        }
+    }
+
+    #[inline]
+    pub fn current_strategy(&self) -> MaterializationStrategy {
+        self.strategy
+    }
+
+    /// Updates empirical selectivity after processing a morsel and dynamically flips strategy if needed
+    pub fn record_morsel_feedback(&mut self, total_tuples: usize, matched_tuples: usize) {
+        if self.morsels_evaluated < self.sample_morsel_limit {
+            self.accumulated_tuples += total_tuples;
+            self.accumulated_matches += matched_tuples;
+            self.morsels_evaluated += 1;
+
+            if self.morsels_evaluated == self.sample_morsel_limit {
+                let empirical_sigma = self.accumulated_matches as f64 / self.accumulated_tuples.max(1) as f64;
+                let optimal_strategy = self.optimizer.select_strategy(empirical_sigma);
+                if optimal_strategy != self.strategy {
+                    // Adaptively swap materialization mode for remaining morsels
+                    self.strategy = optimal_strategy;
+                }
+            }
+        }
+    }
+}
+
 pub struct LateMaterializationGate {
+    pub strategy: MaterializationStrategy,
     pub selection_mask: BooleanArray,
     pub sparse_indices: Option<UInt32Array>,
 }
 
 impl LateMaterializationGate {
     pub fn materialize_column(&self, column: &dyn Array) -> Result<Arc<dyn Array>, EngineError> {
-        if let Some(ref indices) = self.sparse_indices {
-            take(column, indices, None).map_err(|e| EngineError::ArrowError(e.to_string()))
-        } else {
-            arrow::compute::filter(column, &self.selection_mask)
-                .map_err(|e| EngineError::ArrowError(e.to_string()))
+        match self.strategy {
+            MaterializationStrategy::EarlySinglePassScan => {
+                // Pass-through: column was already materialized during the fused scan
+                Ok(Arc::new(column.to_data().into()))
+            }
+            MaterializationStrategy::LateSparseIndices => {
+                let indices = self.sparse_indices.as_ref().ok_or_else(|| {
+                    EngineError::ArrowError("Sparse indices missing for LateSparseIndices strategy".into())
+                })?;
+                take(column, indices, None).map_err(|e| EngineError::ArrowError(e.to_string()))
+            }
+            MaterializationStrategy::LateDenseBitmap => {
+                arrow::compute::filter(column, &self.selection_mask)
+                    .map_err(|e| EngineError::ArrowError(e.to_string()))
+            }
         }
     }
 }
@@ -582,28 +833,60 @@ impl MemoryBudgetTracker {
         }
     }
 
+    /// Reserves memory using single-pass atomic CAS.
+    /// Eliminates transient allocation spikes caused by fetch_add followed by fetch_sub rollback.
     pub fn try_reserve(&self, bytes: usize) -> Result<MemoryReservation, EngineError> {
-        let current = self.allocated.fetch_add(bytes, Ordering::SeqCst);
-        let new_total = current + bytes;
+        let update_result = self.allocated.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |curr| {
+                let new_total = curr.checked_add(bytes)?;
+                if new_total > self.hard_limit {
+                    None // Exceeds hard limit: abort CAS without modifying state
+                } else {
+                    Some(new_total)
+                }
+            },
+        );
 
-        if new_total > self.hard_limit {
-            self.allocated.fetch_sub(bytes, Ordering::SeqCst);
-            return Err(EngineError::OutOfMemory {
-                requested: bytes,
-                current,
-                limit: self.hard_limit,
-            });
+        match update_result {
+            Ok(prev) => {
+                let new_total = prev + bytes;
+                let requires_spill = new_total >= self.soft_limit;
+                Ok(MemoryReservation {
+                    bytes,
+                    requires_spill,
+                })
+            }
+            Err(_) => {
+                let current_alloc = self.allocated.load(Ordering::Relaxed);
+                Err(EngineError::OutOfMemory {
+                    requested: bytes,
+                    current: current_alloc,
+                    limit: self.hard_limit,
+                })
+            }
         }
-
-        let requires_spill = new_total >= self.soft_limit;
-        Ok(MemoryReservation {
-            bytes,
-            requires_spill,
-        })
     }
 
+    /// Releases reserved bytes using atomic CAS with saturating subtraction.
+    /// Underflow wrapping to 2^64 - 1 is mathematically impossible even under accidental over-release.
     pub fn release(&self, bytes: usize) {
-        self.allocated.fetch_sub(bytes, Ordering::SeqCst);
+        let _ = self.allocated.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |curr| Some(curr.saturating_sub(bytes)),
+        );
+    }
+
+    #[inline]
+    pub fn current_usage(&self) -> usize {
+        self.allocated.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn is_spill_required(&self) -> bool {
+        self.allocated.load(Ordering::Relaxed) >= self.soft_limit
     }
 }
 
@@ -617,16 +900,132 @@ pub struct MemoryReservation {
 1. **External Sort**:
    - In-memory sorted runs ($M_{run} = 128\text{ MB}$) are flushed to disk as Arrow IPC files compressed with fast LZ4 frames.
    - Merging streams via a Loser Tree (Min-Heap) reading small chunks ($64\text{ KB}$) per run, bounding RAM footprint to $O(K \times 64\text{ KB})$.
-2. **Hybrid Grace Hash Join**:
-   - Partitions incoming build rows into $P = 64$ hash buckets ($H(k) \pmod P$).
-   - Partition $0$ remains in RAM; Partitions $1..P-1$ spill to temporary Arrow IPC files.
-   - Once build streams finish, partition $0$ is probed immediately. Spilled partitions are then loaded iteratively, built in RAM, and probed.
+2. **Hybrid Grace Hash Join with Skew & Infinite Recursion Safeguards**:
+   - **Dynamic Partition Spilling**: Eliminates static RAM pinning of Partition 0. All $P = 64$ partitions initialize with in-memory streaming write buffers ($64\text{ KB}$). If total memory hits `tracker.soft_limit` (80%), write buffers are flushed dynamically to temporary Arrow IPC files (`RecordBatchFileWriter`), allowing even Partition 0 to spill if it exceeds budget.
+   - **Bounded Recursion ($D_{max} = 3$)**: When loading spilled partition $P_i$ for probe, if $|P_i| > M_{budget}$ and current depth $D < D_{max} = 3$, $P_i$ is re-partitioned into $P_{sub} = 64$ child buckets using salted MurmurHash3:
+     $$H_{D+1}(k) = \text{hash\_seeded}(k, \text{SEED} \oplus ((D + 1) \times \text{0x9e3779b97f4a7c15}))$$
+   - **Degeneracy Detection ($\theta_{skew} = 0.80$)**: If the heaviest sub-partition holds $\ge 80\%$ of volume, key distribution is degenerate (e.g. repeated duplicate keys or millions of `NULL`s). Hashing cannot divide this data. Recursive hash partitioning is aborted immediately.
+   - **Dual Deterministic Fallbacks**:
+     1. *Chunked Block Nested Loop Join (BNLJ)*: Used when duplicate degeneracy is detected. Build data is sliced into memory-bounded chunks ($\le 0.5 \times M_{budget}$) and probed sequentially in RAM, guaranteeing $O(1)$ memory overhead and zero recursion risk.
+     2. *External Radix Sort-Merge Join*: Used when $D = D_{max}$ is reached for non-degenerate data, performing cache-aligned radix sort runs merged via a Loser Tree in linear time.
+
+```rust
+pub const MAX_RECURSION_DEPTH: usize = 3;
+pub const SKEW_THRESHOLD: f64 = 0.80; // 80% volume in one partition flags degeneracy
+
+pub enum PartitionJoinStrategy {
+    InMemoryHashTable,
+    RecursivePartitioning { next_depth: usize },
+    BlockNestedLoopFallback,
+    RadixSortMergeFallback,
+}
+
+pub struct PartitionDescriptor {
+    pub partition_id: usize,
+    pub depth: usize,
+    pub total_bytes: usize,
+    pub row_count: usize,
+    pub is_spilled: bool,
+    pub ipc_file_path: Option<std::path::PathBuf>,
+}
+
+impl PartitionDescriptor {
+    pub fn determine_strategy(
+        &self,
+        memory_budget: usize,
+        max_sub_partition_ratio: f64,
+    ) -> PartitionJoinStrategy {
+        if self.total_bytes <= memory_budget {
+            return PartitionJoinStrategy::InMemoryHashTable;
+        }
+
+        // Check for key skew / duplicate degeneracy
+        if max_sub_partition_ratio >= SKEW_THRESHOLD {
+            return PartitionJoinStrategy::BlockNestedLoopFallback;
+        }
+
+        if self.depth < MAX_RECURSION_DEPTH {
+            PartitionJoinStrategy::RecursivePartitioning {
+                next_depth: self.depth + 1,
+            }
+        } else {
+            // Maximum recursion depth exceeded: fall back to sort-merge join
+            PartitionJoinStrategy::RadixSortMergeFallback
+        }
+    }
+}
+
+/// Fallback execution for degenerate duplicate-key partitions
+pub struct ChunkedBlockNestedLoopJoin {
+    chunk_budget_bytes: usize,
+}
+
+impl ChunkedBlockNestedLoopJoin {
+    pub fn new(total_budget: usize) -> Self {
+        Self {
+            chunk_budget_bytes: total_budget / 2,
+        }
+    }
+
+    /// Processes build and probe streams in memory-bounded blocks without recursion.
+    pub fn execute_join(
+        &self,
+        build_stream: impl Iterator<Item = Result<RecordBatch, EngineError>>,
+        probe_stream_factory: impl Fn() -> Result<Box<dyn Iterator<Item = Result<RecordBatch, EngineError>>>, EngineError>,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        let mut results = Vec::new();
+        let mut current_build_chunk = Vec::new();
+        let mut current_chunk_bytes = 0;
+
+        for batch in build_stream {
+            let b = batch?;
+            let b_bytes = b.get_array_memory_size();
+            current_build_chunk.push(b);
+            current_chunk_bytes += b_bytes;
+
+            if current_chunk_bytes >= self.chunk_budget_bytes {
+                let mut probe_iter = probe_stream_factory()?;
+                while let Some(probe_batch) = probe_iter.next() {
+                    let pb = probe_batch?;
+                    let matched = self.join_block(&current_build_chunk, &pb)?;
+                    if matched.num_rows() > 0 {
+                        results.push(matched);
+                    }
+                }
+                current_build_chunk.clear();
+                current_chunk_bytes = 0;
+            }
+        }
+
+        if !current_build_chunk.is_empty() {
+            let mut probe_iter = probe_stream_factory()?;
+            while let Some(probe_batch) = probe_iter.next() {
+                let pb = probe_batch?;
+                let matched = self.join_block(&current_build_chunk, &pb)?;
+                if matched.num_rows() > 0 {
+                    results.push(matched);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn join_block(
+        &self,
+        _build_batches: &[RecordBatch],
+        _probe_batch: &RecordBatch,
+    ) -> Result<RecordBatch, EngineError> {
+        // Flat vector comparison emitting Cartesian matches bounded strictly to chunk_budget_bytes
+        todo!("Vectorized block equality matcher")
+    }
+}
+```
 
 ---
 
 ## 7. SIMD Vectorization & Safety Contracts
 
-### 7.1 x86 AVX-512 Intrinsics Kernel & Formal `// SAFETY:` Contract
 ### 7.1 x86 AVX-512 Intrinsics Kernel & Formal `// SAFETY:` Contract
 ```rust
 #[cfg(target_arch = "x86_64")]
@@ -659,8 +1058,8 @@ pub unsafe fn filter_i32_avx512(input: &[i32], literal: i32, output: &mut [i32])
     // 2. We use `_mm512_loadu_si512` (unaligned vector load) to guarantee memory safety
     //    even if the Arrow array offset has shifted alignment from the 64-byte boundary.
     // 3. Pointer output.as_mut_ptr() has capacity >= input.len() (asserted above) and is non-overlapping.
-    // 4. `_mm512_mask_compressstoreu_epi32` takes `*mut i32` and writes strictly `mask.count_ones()`
-    //    elements, guaranteeing no out-of-bounds writes beyond the allocated output slice.
+    // 4. `_mm512_mask_compressstoreu_epi32` takes `*mut u8` (or `*mut i32` depending on stdarch binding)
+    //    and writes strictly `mask.count_ones()` elements, guaranteeing no out-of-bounds writes beyond the slice.
     // 5. Function invocation is guarded by CPU feature detection for `avx512f,avx512vl`.
     for i in 0..chunks {
         let in_ptr = input.as_ptr().add(i * lanes);
@@ -668,8 +1067,8 @@ pub unsafe fn filter_i32_avx512(input: &[i32], literal: i32, output: &mut [i32])
         let mask = _mm512_cmp_epi32_mask(vals, lit_vec, _MM_CMPINT_EQ);
 
         let out_ptr = output.as_mut_ptr().add(out_idx);
-        // Correct Rust intrinsic signature accepts *mut i32 directly
-        _mm512_mask_compressstoreu_epi32(out_ptr, mask, vals);
+        // Explicit cast to *mut u8 guarantees strict conformance to core::arch::x86_64
+        _mm512_mask_compressstoreu_epi32(out_ptr as *mut u8, mask, vals);
         out_idx += mask.count_ones() as usize;
     }
 
@@ -690,10 +1089,64 @@ pub unsafe fn filter_i32_avx512(input: &[i32], literal: i32, output: &mut [i32])
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-/// Evaluates equality using 4x unrolled NEON registers (16 lanes = 64 bytes).
-///
-/// # Preconditions
-/// - Output buffer slice capacity must satisfy `output.len() >= input.len()`.
+/// 16-entry byte permutation table for ARM64 NEON vqtbl1q_u8 (256 bytes).
+/// Each row corresponds to a 4-bit lane match pattern (0..15).
+/// Matching 32-bit integer lanes (4 bytes each) are compacted to the front.
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(16))]
+static NEON_PERM_TABLE: [[u8; 16]; 16] = [
+    [0xFF; 16], // 0:  0000 -> 0 matches
+    [0, 1, 2, 3, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], // 1:  0001 (lane 0)
+    [4, 5, 6, 7, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], // 2:  0010 (lane 1)
+    [0, 1, 2, 3, 4, 5, 6, 7, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],             // 3:  0011 (lanes 0, 1)
+    [8, 9, 10, 11, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], // 4:  0100 (lane 2)
+    [0, 1, 2, 3, 8, 9, 10, 11, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],             // 5:  0101 (lanes 0, 2)
+    [4, 5, 6, 7, 8, 9, 10, 11, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],             // 6:  0110 (lanes 1, 2)
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0xFF, 0xFF, 0xFF, 0xFF],                         // 7:  0111 (lanes 0, 1, 2)
+    [12, 13, 14, 15, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], // 8: 1000 (lane 3)
+    [0, 1, 2, 3, 12, 13, 14, 15, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],             // 9: 1001 (lanes 0, 3)
+    [4, 5, 6, 7, 12, 13, 14, 15, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],             // 10: 1010 (lanes 1, 3)
+    [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 0xFF, 0xFF, 0xFF, 0xFF],                         // 11: 1011 (lanes 0, 1, 3)
+    [8, 9, 10, 11, 12, 13, 14, 15, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],             // 12: 1100 (lanes 2, 3)
+    [0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 0xFF, 0xFF, 0xFF, 0xFF],                         // 13: 1101 (lanes 0, 2, 3)
+    [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0xFF, 0xFF, 0xFF, 0xFF],                         // 14: 1110 (lanes 1, 2, 3)
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],                                     // 15: 1111 (all lanes)
+];
+
+#[cfg(target_arch = "aarch64")]
+static POPCOUNT_4BIT: [usize; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
+
+/// Branchless compaction of a 128-bit NEON vector lane using vqtbl1q_u8.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn compact_neon_lane_branchless(
+    vals: int32x4_t,
+    mask: uint32x4_t,
+    weights: uint32x4_t,
+    output: &mut [i32],
+    out_idx: &mut usize,
+) {
+    // 1. Extract 4-bit scalar mask via vector bitwise AND and across-vector addition
+    let masked = vandq_u32(mask, weights);
+    let mask_idx = vaddvq_u32(masked) as usize;
+
+    // 2. Load precomputed permutation vector
+    let perm = vld1q_u8(NEON_PERM_TABLE.get_unchecked(mask_idx).as_ptr());
+
+    // 3. Permute matched lanes to the front
+    let compacted = vqtbl1q_u8(vreinterpretq_u8_s32(vals), perm);
+
+    // 4. Branchless overwrite store (unconditionally writes 4 words = 16 bytes)
+    // SAFETY: caller guarantees output.len() >= input.len(). Because *out_idx <= elements_examined,
+    // *out_idx + 4 <= output.len() is mathematically guaranteed inside the vector loop.
+    vst1q_s32(output.as_mut_ptr().add(*out_idx), vreinterpretq_s32_u8(compacted));
+
+    // 5. Advance output cursor by exact matched count
+    *out_idx += *POPCOUNT_4BIT.get_unchecked(mask_idx);
+}
+
+/// Evaluates equality using 4x unrolled NEON registers with 100% branchless compaction.
+#[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub unsafe fn filter_i32_neon_unrolled(input: &[i32], literal: i32, output: &mut [i32]) -> usize {
     assert!(
@@ -709,13 +1162,13 @@ pub unsafe fn filter_i32_neon_unrolled(input: &[i32], literal: i32, output: &mut
     let mut out_idx = 0;
 
     let lit_vec = vdupq_n_s32(literal);
+    let weights = vld1q_u32([1, 2, 4, 8].as_ptr());
 
     // SAFETY:
-    // 1. input.as_ptr() is dereferenceable for `chunks * 16 * 4` bytes.
-    // 2. `vld1q_s32` performs unaligned vector reads, safely handling arbitrary 4-byte aligned i32 data.
+    // 1. input.as_ptr() is valid and readable for `chunks * 16 * 4` bytes.
+    // 2. vld1q_s32 performs unaligned reads, supporting arbitrary 4-byte aligned i32 slices.
     // 3. Exclusive mutable reference `&mut [i32]` guarantees no aliasing between input and output.
-    // 4. `neon` feature is guaranteed on all AArch64 / Apple Silicon targets.
-    // 5. Remainder elements are processed safely by the bounds-checked scalar tail loop.
+    // 4. compact_neon_lane_branchless never branches on data and writes within buffer bounds.
     for i in 0..chunks {
         let base_ptr = input.as_ptr().add(i * lanes);
 
@@ -729,10 +1182,10 @@ pub unsafe fn filter_i32_neon_unrolled(input: &[i32], literal: i32, output: &mut
         let m2 = vceqq_s32(v2, lit_vec);
         let m3 = vceqq_s32(v3, lit_vec);
 
-        out_idx = compact_neon_lane(v0, m0, output, out_idx);
-        out_idx = compact_neon_lane(v1, m1, output, out_idx);
-        out_idx = compact_neon_lane(v2, m2, output, out_idx);
-        out_idx = compact_neon_lane(v3, m3, output, out_idx);
+        compact_neon_lane_branchless(v0, m0, weights, output, &mut out_idx);
+        compact_neon_lane_branchless(v1, m1, weights, output, &mut out_idx);
+        compact_neon_lane_branchless(v2, m2, weights, output, &mut out_idx);
+        compact_neon_lane_branchless(v3, m3, weights, output, &mut out_idx);
     }
 
     for &val in &input[chunks * lanes..] {
@@ -742,25 +1195,6 @@ pub unsafe fn filter_i32_neon_unrolled(input: &[i32], literal: i32, output: &mut
         }
     }
 
-    out_idx
-}
-
-/// Compacts matched elements from a 128-bit NEON vector lane into output.
-/// Uses lane test logic; for ultra-high throughput on wide M-series execution ports,
-/// a branchless byte-permutation table lookup (`vqtbl1q_u8`) is deployed for dense matches.
-#[inline(always)]
-unsafe fn compact_neon_lane(
-    vals: int32x4_t,
-    mask: uint32x4_t,
-    output: &mut [i32],
-    mut out_idx: usize,
-) -> usize {
-    let m: [u32; 4] = std::mem::transmute(mask);
-    let v: [i32; 4] = std::mem::transmute(vals);
-    if m[0] != 0 { output[out_idx] = v[0]; out_idx += 1; }
-    if m[1] != 0 { output[out_idx] = v[1]; out_idx += 1; }
-    if m[2] != 0 { output[out_idx] = v[2]; out_idx += 1; }
-    if m[3] != 0 { output[out_idx] = v[3]; out_idx += 1; }
     out_idx
 }
 ```
@@ -816,9 +1250,48 @@ pub fn filter_i32_scalar_fallback(input: &[i32], literal: i32, output: &mut [i32
     out_idx
 }
 
+/// Miri Software Emulation Kernel exercising explicit raw pointer arithmetic.
+/// Audits stacked borrows, pointer provenance, and slice bounds without physical SIMD intrinsics.
 #[cfg(miri)]
-unsafe fn filter_i32_miri_emulation(input: &[i32], literal: i32, output: &mut [i32]) -> usize {
-    filter_i32_scalar_fallback(input, literal, output)
+pub unsafe fn filter_i32_miri_emulation(
+    input: &[i32],
+    literal: i32,
+    output: &mut [i32],
+) -> usize {
+    let len = input.len();
+    let lanes = 16;
+    let chunks = len / lanes;
+    let mut out_idx = 0;
+
+    // Emulate 16-lane vector chunks using raw pointer reads and writes
+    for i in 0..chunks {
+        let in_base = input.as_ptr().add(i * lanes);
+        let out_base = output.as_mut_ptr().add(out_idx);
+        let mut matched_in_chunk = 0;
+
+        for lane in 0..lanes {
+            // Miri validates raw pointer provenance and in-bounds dereferencing
+            let val = *in_base.add(lane);
+            if val == literal {
+                *out_base.add(matched_in_chunk) = val;
+                matched_in_chunk += 1;
+            }
+        }
+        out_idx += matched_in_chunk;
+    }
+
+    // Emulate scalar tail using raw pointer arithmetic
+    let tail_base = input.as_ptr().add(chunks * lanes);
+    let tail_elements = len - chunks * lanes;
+    for tail_idx in 0..tail_elements {
+        let val = *tail_base.add(tail_idx);
+        if val == literal {
+            *output.as_mut_ptr().add(out_idx) = val;
+            out_idx += 1;
+        }
+    }
+
+    out_idx
 }
 ```
 

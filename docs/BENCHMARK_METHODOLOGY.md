@@ -61,21 +61,36 @@ To eliminate environmental jitter, thermal throttling, and context switching art
 - **Metric**: Elapsed execution time per morsel and L1D miss rate.
 
 ```rust
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, BenchmarkId, Criterion, Throughput};
 
-fn bench_morsel_sizes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("morsel_sizing_l1_l2");
+pub fn bench_morsel_sizes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("morsel_sizing_l1_l2_streaming");
     let morsel_sizes = [256, 512, 1024, 2048, 4096, 8192, 16384];
 
-    for &size in &morsel_sizes {
-        let input: Vec<i32> = (0..size as i32).collect();
-        let mut output = vec![0i32; size];
+    // Allocate 256 MB contiguous working set (64M elements) exceeding CPU L3 cache
+    // (M4 Max 32 MB SLC / Zen 4 384 MB shared L3 slice) to force memory bus traversal.
+    const TOTAL_ELEMENTS: usize = 64 * 1024 * 1024;
+    let working_buffer: Vec<i32> = (0..TOTAL_ELEMENTS as i32).collect();
+    let mut output_buffer: Vec<i32> = vec![0i32; TOTAL_ELEMENTS];
 
-        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+    for &size in &morsel_sizes {
+        // Essential: Normalize by elements to report ns/tuple and GB/s
+        group.throughput(Throughput::Elements(size as u64));
+
+        let num_morsels = TOTAL_ELEMENTS / size;
+        let mut morsel_idx = 0;
+
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &m_size| {
             b.iter(|| {
-                // Evaluates tight arithmetic across morsel
-                for i in 0..size {
-                    output[i] = black_box(input[i] * 2 + 1);
+                // Advance ring buffer pointer across successive morsels
+                let offset = (morsel_idx % num_morsels) * m_size;
+                morsel_idx = morsel_idx.wrapping_add(1);
+
+                let in_slice = &working_buffer[offset..offset + m_size];
+                let out_slice = &mut output_buffer[offset..offset + m_size];
+
+                for i in 0..m_size {
+                    out_slice[i] = black_box(in_slice[i] * 2 + 1);
                 }
             });
         });
@@ -205,31 +220,44 @@ $$\text{Peak}_{\text{compute}} = N_{\text{cores}} \times f_{\text{clk}} \times W
 
 $$P = \min\left( \text{Peak}_{\text{compute}}, \quad \text{Bandwidth}_{\text{mem}} \times I \right)$$
 
+$$\text{Bandwidth}_{\text{per-core}} = \frac{\text{Aggregate Memory Bandwidth}}{\text{Active Core Count}}$$
+$$I_{crit} = \frac{\text{Peak Compute (GFLOPS)}}{\text{Aggregate Memory Bandwidth (GB/s)}}$$
+
+| Platform | Cores | Peak Memory Bandwidth | Per-Core Bandwidth | Peak Compute (GFLOPS) | Critical Intensity $I_{crit}$ |
+|---|---|---|---|---|---|
+| **Intel Ice Lake (Xeon 8380)** | 80 | $204\text{ GB/s}$ (DDR4) | $2.55\text{ GB/s/core}$ | $4,096$ | $20.08\text{ FLOP/Byte}$ |
+| **AMD Genoa (EPYC 9654)** | 96 | $460\text{ GB/s}$ (12-ch DDR5) | $4.79\text{ GB/s/core}$ | $14,745$ | $32.06\text{ FLOP/Byte}$ |
+| **Apple M4 Max (14-core)** | 14 | $410\text{ GB/s}$ (UMA) | $\mathbf{29.29\text{ GB/s/core}}$ | $1,536$ | $\mathbf{3.75\text{ FLOP/Byte}}$ |
+
 ```
 Throughput (GFLOPS)
    ▲
-   │                              ┌───────────────── AMD Zen 4 AVX-512 Peak
-   │               ┌──────────────┼───────────────── Intel Xeon AVX-512 Peak
+   │                              ┌───────────────── AMD Zen 4 AVX-512 Peak (14,745 GFLOPS)
+   │               ┌──────────────┼───────────────── Intel Xeon AVX-512 Peak (4,096 GFLOPS)
    │              /              /
-   │             /              / ┌───────────────── Apple M4 Max Peak (1536 GFLOPS)
+   │             /              / ┌───────────────── Apple M4 Max Peak (1,536 GFLOPS)
    │            /              / /
-   │           /              / / ◄── Memory Wall: Intel DDR4-3200 (204 GB/s)
+   │           /              / / ◄── Memory Wall: Intel DDR4-3200 (204 GB/s, 2.55 GB/s/core)
    │          /              / /
-   │         /  ◄───────────┼─┼────── Memory Wall: Apple M4 UMA (410 GB/s) & AMD DDR5 (460 GB/s)
+   │         /  ◄───────────┼─┼────── Memory Wall: Apple M4 UMA (410 GB/s, 29.29 GB/s/core) & AMD DDR5 (460 GB/s)
    │        /               │ │
    └───────┴────────────────┴─┴──────────────────► Operational Intensity (Flops/Byte)
 ```
 
 **Key Architectural Insight**:
-Because analytical scan/filter queries typically possess low operational intensity ($I \le 0.5\text{ Flops/Byte}$), query throughput is governed primarily by memory bandwidth rather than peak vector ALUs. The $410\text{ GB/s}$ memory bus on Apple Silicon M4 Max and $460\text{ GB/s}$ DDR5 on AMD Genoa allow vectorized interpretation to sustain high data throughput without requiring the register-resident compilation needed on bandwidth-constrained DDR4 systems.
+Because analytical scan/filter queries typically possess low operational intensity ($I \le 0.5\text{ Flops/Byte}$), query throughput is governed primarily by memory bandwidth rather than peak vector ALUs. Apple Silicon delivers **$6.1\times$ higher memory bandwidth per core** ($29.29\text{ GB/s}$ vs $4.79\text{ GB/s}$) and a dramatically lower critical operational intensity threshold ($I_{crit} = 3.75\text{ FLOP/Byte}$ vs $32.06\text{ FLOP/Byte}$) than 96-core AMD Genoa. This enables vectorized morsel execution on Apple Silicon to sustain near-peak data throughput without requiring the register-resident compilation needed on bandwidth-starved enterprise cores.
 
 ---
 
 ## 5. Formal Scientific Hypotheses & Validation Gates
 
-### Hypothesis $H_1$ (Crossover Validity)
-- **Statement**: Relational pipelines with Expression Complexity Index $ECI \ge 6.0$ achieve $\ge 2.2\times$ throughput speedup under JIT compilation compared to vectorized interpretation for $N > 10^6$ tuples, with compilation latency $T_{comp}$ being amortized within $N_{crossover} \le 5 \times 10^5$ tuples.
-- **Validation Gate**: Pass if measured $N_{crossover}$ on ClickBench Q15-Q20 matches the predicted model value within a $15\%$ relative error margin.
+### Hypothesis $H_{1a}$ (Cranelift Sub-Millisecond Interactive JIT)
+- **Statement**: For expression pipelines with Expression Complexity Index $ECI \ge 4.0$, Cranelift JIT compilation latency $T_{comp} \le 1.5\text{ ms}$ is amortized within $N_{crossover} \le 200\,000$ tuples, achieving $\ge 1.3\times$ speedup over vectorized interpretation for interactive queries ($N \in [2\times 10^5, 2\times 10^6]$).
+- **Validation Gate**: Pass if measured $N_{crossover}$ on synthetic arithmetic filters matches predicted model value within a $15\%$ relative error margin.
+
+### Hypothesis $H_{1b}$ (LLVM High-Optimization Batch JIT)
+- **Statement**: For expression pipelines with $ECI \ge 8.0$, LLVM (O2/O3) JIT compilation achieves $\ge 2.2\times$ steady-state throughput speedup over vectorized interpretation for large batch scans ($N \ge 10^7$ tuples), with compilation latency $T_{comp} \le 45\text{ ms}$ amortized within $N_{crossover} \le 6 \times 10^6$ tuples.
+- **Validation Gate**: Pass if measured steady-state throughput on ClickBench Q15–Q28 achieves $\ge 2.2\times$ vectorized baseline.
 
 ### Hypothesis $H_2$ (Hardware Architecture Crossover Invariance Violation)
 - **Statement**: The optimal JIT crossover point is not architecture-invariant:
@@ -238,7 +266,7 @@ Because analytical scan/filter queries typically possess low operational intensi
 
 ### Hypothesis $H_3$ (Two-Tier Multi-Tier Amortization)
 - **Statement**: An adaptive execution tier (starting immediately with vectorized morsels and hot-swapping asynchronously to JIT-compiled kernels via atomic function pointer swaps) incurs zero compile latency on short queries ($N < 10^5$) while achieving within $3\%$ of pure JIT steady-state execution on long queries ($N \ge 10^7$).
-- **Validation Gate**: Pass if adaptive query runtime deviates by $< 3\%$ from static JIT on TPC-H Q1 (SF10) and is $\ge 10\times$ faster on small ad-hoc queries ($N = 10^4$).
+- **Validation Gate**: Pass if adaptive query runtime deviates by $< 3\%$ from static JIT on compound arithmetic queries (TPC-H Q19 or ClickBench Q28, SF10) and is $\ge 10\times$ faster on small ad-hoc queries ($N = 10^4$). (Note: TPC-H Q1 is excluded from JIT validation because its primitive scan ($ECI \le 3.0$) is mathematically optimal under precompiled SIMD).
 
 ---
 

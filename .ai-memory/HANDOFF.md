@@ -1,6 +1,6 @@
-# Handoff — Fase 1
+# Handoff — Fase 2 (revisão adversarial)
 
-- Estado: documentação da arquitetura, RFC, modelo de custo e metodologia na raiz `docs/`; harness adversarial em `verification/`.
-- Entrega deste turno: README executivo da Fase 1; inclusão dos artefatos no primeiro commit do repositório.
-- Verificação: `cd verification && cargo run --offline --locked --quiet` concluiu com código 0 em Rust 1.99.1; o harness emitiu avisos de compilação e relatou limites de Miri e de materialização tardia.
-- Limite: o motor, o JIT e os benchmarks descritos ainda não estão implementados neste repositório. Reavaliar alegações quantitativas dos documentos com medições reproduzíveis.
+- Estado: Gate 2 aprovado; remediações adversariais consolidadas em `docs/ARCHITECTURE_SPEC.md`, `docs/COST_MODEL_FORMULATION.md`, `docs/BENCHMARK_METHODOLOGY.md` e `docs/RFC-0001-NATIVE-DATA-ENGINE-RESEARCH.md`.
+- Entrega: dispatcher de morsels em streaming, contrato Arrow `StringView`, sincronização e invalidação de I-cache para JIT em Apple Silicon, travas do modelo de custo e metodologia H1a/H1b com métricas de barramento; README atualizado.
+- Verificação: `cd verification && cargo test --offline --locked` passou: 6 testes unitários + 5 de modelo de custo + 12 de estresse = 23/23.
+- Limite: `verification/` simula os contratos; motor, JIT e benchmarks ponta a ponta ainda não foram implementados. A “Phase 2” do roteiro da RFC é a futura implementação JIT, distinta deste Gate 2.
