@@ -3,7 +3,7 @@
 //! Ordering per key: nulls go first or last (`nulls_first`, independent of direction); non-null
 //! values compare by type order (Float64 via `total_cmp`, so -0.0 < 0.0 and NaN sorts last),
 //! reversed when descending. Ties keep input order, so both paths produce the same stable result.
-use crate::column::{Batch, Column, Values};
+use crate::column::{Batch, Column, StringViews, Values};
 use crate::eval::eval;
 use crate::expr::Expr;
 use crate::memory::MemoryBudget;
@@ -98,8 +98,8 @@ fn external_sort(
             // Even alone the piece does not fit: halve it and retry, preserving row order.
             let half = piece.num_rows / 2;
             let rest = piece.num_rows - half;
-            pending.push_front(piece.slice(half, rest));
-            pending.push_front(piece.slice(0, half));
+            pending.push_front(slice_compact(&piece, half, rest));
+            pending.push_front(slice_compact(&piece, 0, half));
             continue;
         }
         return Err(EngineError::Memory { requested: size, available: budget.available() });
@@ -123,8 +123,32 @@ fn split_rows(batch: Batch, batch_rows: usize) -> Vec<Batch> {
     }
     (0..batch.num_rows)
         .step_by(batch_rows)
-        .map(|start| batch.slice(start, batch_rows.min(batch.num_rows - start)))
+        .map(|start| slice_compact(&batch, start, batch_rows.min(batch.num_rows - start)))
         .collect()
+}
+
+/// Rows `start..start + len` as a standalone batch. Utf8 bytes are copied, because `Batch::slice`
+/// shares the parent's string buffers and `byte_size` would charge the whole buffer to every piece.
+fn slice_compact(batch: &Batch, start: usize, len: usize) -> Batch {
+    let end = start + len;
+    let columns = batch
+        .columns
+        .iter()
+        .map(|c| {
+            let values = match &c.values {
+                Values::Bool(v) => Values::Bool(v[start..end].to_vec()),
+                Values::Int64(v) => Values::Int64(v[start..end].to_vec()),
+                Values::Float64(v) => Values::Float64(v[start..end].to_vec()),
+                Values::Utf8(sv) => {
+                    let strs: Vec<&str> = (start..end).map(|i| sv.get(i)).collect();
+                    Values::Utf8(StringViews::from_strs(&strs))
+                }
+            };
+            let validity = c.validity.as_ref().map(|m| m[start..end].to_vec());
+            Column { values, validity }
+        })
+        .collect();
+    Batch { schema: batch.schema.clone(), columns, num_rows: len }
 }
 
 /// Sorts buffered pieces in memory and writes them to one spill file as `batch_rows` chunks.
@@ -648,6 +672,30 @@ mod tests {
             assert!(*id > last_by_key[k], "stability broken at output position {pos}");
             last_by_key[k] = *id;
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn external_sort_with_long_strings_in_one_big_batch_fits_budget() {
+        // Each sliced piece shares the parent's string buffer, so its byte_size must not
+        // count the whole buffer or the pieces would never fit a small budget.
+        let dir = spill_dir("longstr");
+        let rows: Vec<Row> = (0..2_000)
+            .map(|id| Row {
+                id,
+                k1: Some((id * 7919) % 101),
+                k2: Some(format!("{:05}-{}", (id * 31) % 2_000, "x".repeat(95))),
+                k3: None,
+            })
+            .collect();
+        let order = [sf(1, true, true), sf(2, true, true)];
+        let (reference, _) =
+            sort_batches_with_stats(vec![build(&rows)], schema(), &order, &big_budget(), &dir, 256).unwrap();
+        let tiny = MemoryBudget::new(64 * 1024);
+        let (external, stats) =
+            sort_batches_with_stats(vec![build(&rows)], schema(), &order, &tiny, &dir, 256).unwrap();
+        assert!(stats.runs_spilled >= 2);
+        assert_eq!(canonical_rows(&external), canonical_rows(&reference));
         fs::remove_dir_all(&dir).unwrap();
     }
 
