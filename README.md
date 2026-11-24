@@ -1,6 +1,6 @@
 # Motor nativo de dados — Fase 2: endurecimento adversarial da especificação
 
-Este repositório registra a proposta técnica de um motor analítico nativo em **Rust 1.75+**. A Fase 1 formalizou a arquitetura, o modelo de custo e o protocolo de avaliação. A **Fase 2 de revisão adversarial e remediações de baixo nível** foi concluída e aprovada no Gate 2: o crate de verificação passou em **23/23 testes** (`cargo test --offline --locked`). O motor de consultas, os backends JIT e as suítes de benchmark ainda não estão implementados aqui. A RFC permanece em estado *Authoritative Draft*.
+Este repositório registra a proposta técnica de um motor analítico nativo em **Rust 1.75+**. A Fase 1 formalizou a arquitetura, o modelo de custo e o protocolo de avaliação. A **Fase 2 de revisão adversarial e remediações de baixo nível** foi concluída e aprovada no Gate 2: o crate de verificação passou em **23/23 testes** (`cargo test --offline --locked`). Um **MVP executável** do motor vive em [`engine/`](engine/) (ver abaixo). Backends JIT (Cranelift/LLVM) e as suítes TPC-H/ClickBench continuam **fora de escopo** e não foram implementados. A RFC permanece em estado *Authoritative Draft*.
 
 ## Decisões arquiteturais
 
@@ -36,6 +36,31 @@ cargo run --offline --locked --quiet
 ```
 
 O comando `cargo test` passou em **6 testes unitários, 5 testes de modelo de custo e 12 testes de estresse (23/23)** na conclusão da Fase 2. O harness também exercita contrapressão, bloqueio de workers Rayon, desvio de partições por chaves repetidas, sensibilidade da materialização tardia à seletividade, comparação de `StringView` e casos NEON em AArch64. Sua saída demonstra comportamentos dos cenários simulados; **não valida** o desempenho ponta a ponta, a segurança integral de SIMD ou as hipóteses H1a/H1b, H2 e H3. O caminho de emulação Miri descrito pelo harness não cobre intrínsecos SIMD nem ponteiros brutos. Medidas pontuais de tempo variam por máquina; afirmações quantitativas do próprio harness devem ser conferidas contra os valores que ele imprime.
+
+## Engine MVP (`engine/`)
+
+Crate Rust `native_engine` sem Arrow: colunas próprias (`Vec` tipado + validade + `StringView` de 16 bytes). Implementa, com testes:
+
+| Módulo | O que faz |
+| --- | --- |
+| `expr`, `eval` | AST tipada, inferência de tipos, avaliação vetorizada com lógica de 3 valores, otimizador de constantes |
+| `sched` | Morsels em pool Rayon dedicado (ordem preservada, erro aborta) e ponte Tokio→Rayon com contrapressão |
+| `memory`, `spill`, `sort` | Orçamento hierárquico, arquivos de spill, ordenação externa |
+| `aggregate`, `join` | Agregação hash (sem spill) e hash join com partições Grace em disco, terminação garantida sob skew |
+| `cost` | Modelo `N_crossover`, ECI e tier adaptativo (apenas política; **sem codegen JIT**) |
+| `simd` | Kernels NEON/AVX2 com referência scalar e testes diferenciais (AVX2 **não compilado nem executado** neste Mac) |
+| `catalog`, `exec`, `bin/ndq` | CSV, executor do plano lógico e CLI |
+
+```bash
+cd engine
+cargo test                      # 179 unitários + 26 e2e
+cargo clippy --all-targets -- -D warnings
+cargo run --release --bin ndq -- demo     # 1M linhas: filtro, group-by, join+top5
+cargo run --release --bin ndq -- csv dados.csv --where valor ">" 10 --select id,valor --limit 20
+cargo run --release --bin ndq -- bench    # microbenchmarks de laptop
+```
+
+**Limites declarados.** Não há parser SQL (planos são montados em Rust; o `ndq csv` aceita só um filtro simples). Agregação não faz spill. Cranelift/LLVM, TPC-H SF100 e ClickBench 100M não foram feitos. `ndq bench` mede um único laptop e **não valida** H1a/H1b, H2 nem H3; no Apple Silicon medido, o kernel NEON `gt_i64` empatou com o scalar autovetorizado (0,97x).
 
 ## Próximos marcos
 
