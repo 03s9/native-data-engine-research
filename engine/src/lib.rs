@@ -7,6 +7,7 @@ pub mod cost;
 pub mod eval;
 pub mod exec;
 pub mod expr;
+pub mod jit;
 pub mod join;
 pub mod memory;
 pub mod plan;
