@@ -1,6 +1,5 @@
-//! End-to-end tests through the public API: CSV loading, plan execution, determinism and error cases.
-//! Aggregate and join tests skip (print a note and return) while `aggregate::hash_aggregate` or
-//! `join::hash_join` still return `EngineError::Unimplemented` (slice D2 not merged yet).
+//! End-to-end tests through the public API: CSV loading, plan execution, determinism, joins,
+//! aggregates, spilling under a tiny memory budget, and error cases.
 use native_engine::catalog::{load_csv, Catalog};
 use native_engine::column::{Batch, Column};
 use native_engine::eval::{binary, col, lit};
@@ -104,18 +103,6 @@ fn null_i() -> ScalarValue {
 
 fn null_s() -> ScalarValue {
     ScalarValue::Null(DataType::Utf8)
-}
-
-/// Runs the plan; `None` (with a note) if the operator is still a D2 stub.
-fn run_or_skip(plan: &LogicalPlan, cat: &Catalog, cx: &ExecContext) -> Option<Vec<Batch>> {
-    match execute(plan, cat, cx) {
-        Ok(b) => Some(b),
-        Err(EngineError::Unimplemented(what)) => {
-            eprintln!("SKIPPED: {what} is not implemented yet (needs slice D2)");
-            None
-        }
-        Err(e) => panic!("unexpected error: {e}"),
-    }
 }
 
 /// Temporary CSV file, removed on drop.
@@ -417,7 +404,7 @@ fn sort_and_filter_output_is_identical_at_1_and_8_threads() {
     assert!(!rows(&one).is_empty());
 }
 
-// ---------- aggregate and join (skipped until slice D2 lands) ----------
+// ---------- aggregate and join ----------
 
 #[test]
 fn aggregate_group_sum_and_count_with_null_group() {
@@ -435,7 +422,7 @@ fn aggregate_group_sum_and_count_with_null_group() {
         ],
         schema: out_schema,
     };
-    let Some(out) = run_or_skip(&plan, &cat, &ctx(2, 2)) else { return };
+    let out = execute(&plan, &cat, &ctx(2, 2)).expect("plan runs");
     // Nulls ignored by SUM, counted by COUNT(*); NULL is its own group.
     assert_eq!(
         sorted_rows(&out),
@@ -461,7 +448,7 @@ fn aggregate_without_groups_on_empty_input_returns_one_row() {
         ],
         schema: schema(&[("cnt", DataType::Int64, false), ("sum", DataType::Int64, true)]),
     };
-    let Some(out) = run_or_skip(&plan, &cat, &ctx(1, 10)) else { return };
+    let out = execute(&plan, &cat, &ctx(1, 10)).expect("plan runs");
     assert_eq!(rows(&out), vec![vec![int(0), null_i()]]);
 }
 
@@ -477,8 +464,11 @@ fn join_fixture() -> (Catalog, SchemaRef, SchemaRef) {
 }
 
 fn join_plan(join_type: JoinType, left: &SchemaRef, right: &SchemaRef) -> LogicalPlan {
+    // Semi and Anti emit left rows only; the other types emit left then right columns.
     let mut fields = left.fields.clone();
-    fields.extend(right.fields.clone());
+    if !matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        fields.extend(right.fields.clone());
+    }
     LogicalPlan::Join {
         left: scan("l", left),
         right: scan("r", right),
@@ -492,7 +482,7 @@ fn join_plan(join_type: JoinType, left: &SchemaRef, right: &SchemaRef) -> Logica
 fn inner_join_produces_duplicate_cross_product_and_drops_null_keys() {
     let (cat, left, right) = join_fixture();
     let plan = join_plan(JoinType::Inner, &left, &right);
-    let Some(out) = run_or_skip(&plan, &cat, &ctx(2, 2)) else { return };
+    let out = execute(&plan, &cat, &ctx(2, 2)).expect("plan runs");
     assert_eq!(
         sorted_rows(&out),
         sorted(vec![
@@ -508,7 +498,7 @@ fn inner_join_produces_duplicate_cross_product_and_drops_null_keys() {
 fn left_join_keeps_unmatched_left_rows_padded_with_nulls() {
     let (cat, left, right) = join_fixture();
     let plan = join_plan(JoinType::Left, &left, &right);
-    let Some(out) = run_or_skip(&plan, &cat, &ctx(2, 2)) else { return };
+    let out = execute(&plan, &cat, &ctx(2, 2)).expect("plan runs");
     assert_eq!(
         sorted_rows(&out),
         sorted(vec![
@@ -520,4 +510,169 @@ fn left_join_keeps_unmatched_left_rows_padded_with_nulls() {
             vec![null_i(), s("d"), null_i(), null_i()],
         ])
     );
+}
+
+#[test]
+fn right_join_keeps_unmatched_right_rows_padded_with_nulls() {
+    let (cat, left, right) = join_fixture();
+    let plan = join_plan(JoinType::Right, &left, &right);
+    let out = execute(&plan, &cat, &ctx(2, 2)).expect("plan runs");
+    assert_eq!(
+        sorted_rows(&out),
+        sorted(vec![
+            vec![int(2), s("b"), int(2), int(10)],
+            vec![int(2), s("b"), int(2), int(20)],
+            vec![int(2), s("c"), int(2), int(10)],
+            vec![int(2), s("c"), int(2), int(20)],
+            vec![null_i(), null_s(), int(3), int(30)],
+            vec![null_i(), null_s(), null_i(), int(40)],
+        ])
+    );
+}
+
+#[test]
+fn full_join_keeps_unmatched_rows_from_both_sides() {
+    let (cat, left, right) = join_fixture();
+    let plan = join_plan(JoinType::Full, &left, &right);
+    let out = execute(&plan, &cat, &ctx(2, 2)).expect("plan runs");
+    assert_eq!(
+        sorted_rows(&out),
+        sorted(vec![
+            vec![int(2), s("b"), int(2), int(10)],
+            vec![int(2), s("b"), int(2), int(20)],
+            vec![int(2), s("c"), int(2), int(10)],
+            vec![int(2), s("c"), int(2), int(20)],
+            vec![int(1), s("a"), null_i(), null_i()],
+            vec![null_i(), s("d"), null_i(), null_i()],
+            vec![null_i(), null_s(), int(3), int(30)],
+            vec![null_i(), null_s(), null_i(), int(40)],
+        ])
+    );
+}
+
+#[test]
+fn semi_join_emits_each_matching_left_row_once_with_left_columns_only() {
+    let (cat, left, right) = join_fixture();
+    let plan = join_plan(JoinType::Semi, &left, &right);
+    let out = execute(&plan, &cat, &ctx(2, 2)).expect("plan runs");
+    // Left rows 2/b and 2/c each match two right rows but appear once.
+    assert_eq!(sorted_rows(&out), sorted(vec![vec![int(2), s("b")], vec![int(2), s("c")]]));
+}
+
+#[test]
+fn anti_join_keeps_left_rows_without_a_match_including_null_keys() {
+    let (cat, left, right) = join_fixture();
+    let plan = join_plan(JoinType::Anti, &left, &right);
+    let out = execute(&plan, &cat, &ctx(2, 2)).expect("plan runs");
+    assert_eq!(sorted_rows(&out), sorted(vec![vec![int(1), s("a")], vec![null_i(), s("d")]]));
+}
+
+// ---------- tiny memory budget: spilling must not change results ----------
+
+/// Spill directory unique to this process and test, removed on drop (also when the test panics).
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("ndq_e2e_spill_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create spill dir");
+        TempDir(p)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tiny_ctx(dir: &TempDir) -> ExecContext {
+    ExecContext { threads: 4, morsel_rows: 4096, budget: MemoryBudget::new(64 * 1024), spill_dir: dir.0.clone() }
+}
+
+/// Left: `lid` (nullable, NULL every 997th row, otherwise the row index), `lpay` (Utf8, unique, ~40 bytes).
+fn left_payload_side(n: usize) -> (SchemaRef, Vec<Batch>) {
+    let sch = schema(&[("lid", DataType::Int64, true), ("lpay", DataType::Utf8, false)]);
+    let ids: Vec<Option<i64>> = (0..n).map(|i| if i % 997 == 0 { None } else { Some(i as i64) }).collect();
+    let pays: Vec<String> = (0..n).map(|i| format!("L-{i:08}-{}", "x".repeat(24))).collect();
+    let pay_refs: Vec<Option<&str>> = pays.iter().map(|p| Some(p.as_str())).collect();
+    let b = batches(&sch, &[i64_col(&ids), str_col(&pay_refs)], 4096);
+    (sch, b)
+}
+
+/// Right: `rid` (nullable, NULL every 1009th row, else `i * 7 % 40_000` so keys repeat past 40k rows), `rpay`.
+fn right_payload_side(n: usize) -> (SchemaRef, Vec<Batch>) {
+    let sch = schema(&[("rid", DataType::Int64, true), ("rpay", DataType::Utf8, false)]);
+    let ids: Vec<Option<i64>> =
+        (0..n).map(|i| if i % 1009 == 0 { None } else { Some((i as i64 * 7) % 40_000) }).collect();
+    let pays: Vec<String> = (0..n).map(|i| format!("R-{i:08}-{}", "y".repeat(24))).collect();
+    let pay_refs: Vec<Option<&str>> = pays.iter().map(|p| Some(p.as_str())).collect();
+    let b = batches(&sch, &[i64_col(&ids), str_col(&pay_refs)], 4096);
+    (sch, b)
+}
+
+#[test]
+fn full_join_under_tiny_budget_spills_and_matches_large_budget() {
+    const N: usize = 50_000;
+    let (lsch, lb) = left_payload_side(N);
+    let (rsch, rb) = right_payload_side(N);
+    let mut cat = Catalog::new();
+    cat.register("l", lsch.clone(), lb.clone());
+    cat.register("r", rsch.clone(), rb.clone());
+    let plan = join_plan(JoinType::Full, &lsch, &rsch);
+
+    let dir = TempDir::new("join");
+    let tiny = execute(&plan, &cat, &tiny_ctx(&dir)).expect("tiny-budget join runs");
+    let big = execute(&plan, &cat, &ctx(4, 4096)).expect("1 GiB join runs");
+
+    // The tiny budget must really force spilling, otherwise this test proves nothing.
+    let on = vec![(c(&lsch, "lid"), c(&rsch, "rid"))];
+    let (_, stats) = native_engine::join::hash_join_with_stats(
+        lb,
+        rb,
+        JoinType::Full,
+        &on,
+        plan.schema(),
+        &MemoryBudget::new(64 * 1024),
+        &dir.0,
+    )
+    .expect("stats join runs");
+    assert!(stats.spill_files > 0, "64 KiB budget did not spill");
+
+    let tiny_rows = rows(&tiny);
+    assert!(tiny_rows.len() > N, "expected a full join with more output rows than inputs");
+    assert_eq!(sorted(tiny_rows), sorted_rows(&big));
+}
+
+#[test]
+fn sort_under_tiny_budget_spills_and_matches_large_budget() {
+    const N: usize = 50_000;
+    let (sch, b) = left_payload_side(N);
+    let cat = catalog_with("t", &sch, b.clone());
+    let order_by = vec![
+        SortField { expr: c(&sch, "lid"), ascending: true, nulls_first: true },
+        SortField { expr: c(&sch, "lpay"), ascending: false, nulls_first: false },
+    ];
+    let plan = LogicalPlan::Sort { input: scan("t", &sch), order_by: order_by.clone() };
+
+    let dir = TempDir::new("sort");
+    let tiny = execute(&plan, &cat, &tiny_ctx(&dir)).expect("tiny-budget sort runs");
+    let big = execute(&plan, &cat, &ctx(4, 4096)).expect("1 GiB sort runs");
+
+    // The tiny budget must really force spilling, otherwise this test proves nothing.
+    let (_, stats) = native_engine::sort::sort_batches_with_stats(
+        b,
+        sch.clone(),
+        &order_by,
+        &MemoryBudget::new(64 * 1024),
+        &dir.0,
+        4096,
+    )
+    .expect("stats sort runs");
+    assert!(stats.runs_spilled > 0, "64 KiB budget did not spill");
+
+    // Sort output order is part of the contract, so compare without re-sorting.
+    assert_eq!(rows(&tiny).len(), N);
+    assert_eq!(rows(&tiny), rows(&big));
 }
