@@ -22,12 +22,12 @@ Cranelift **0.138**: `load`/`store` recebem `MemFlagsData::trusted()`; usar `ish
 | ID | Dono | Arquivos (exclusivos) | Entrega | Aceite | Depende |
 | --- | --- | --- | --- | --- | --- |
 | T1 | Fable (orquestrador) | `engine/src/jit.rs`, `Cargo.toml`, `lib.rs` | Protótipo `a + b` Int64 e contrato congelado | teste diferencial passa — **feito** | — |
-| T2 | Haiku `jit-codegen` | `engine/src/jit.rs` | Int64/Float64, literais, `Add/Sub/Mul`, `Neg`, `Cast Int64→Float64`, comparações → Boolean. `Div/Mod/And/Or/Case/InList/Utf8` ficam não suportados | `cargo test jit` + clippy | T1 |
-| T3 | Haiku `jit-diff` | `engine/tests/jit_diff.rs` | Testes diferenciais JIT × `eval` com expressões aleatórias, NULLs, extremos de i64, NaN, lotes de 0/1/8191 linhas | ≥ 2000 casos suportados, 0 divergências | T2 |
-| T4 | Haiku `jit-bench` | `engine/src/bin/h1a.rs` | Mede `T_comp`, `t_vec`, `t_jit` por tupla em grade de ECI × N; localiza o cruzamento real; grava CSV | roda em release; saídas JIT = eval antes de cronometrar | T1 |
-| T5 | Fable (orquestrador) | `docs/RESULTS-H1A.md` | Executa T4 pós-merge, aplica benchmark-checklist, veredito por critério de H1a | cada número com método e limite declarado | T2, T3, T4 |
-| T6 | Haiku, **condicional** | `engine/src/exec.rs` | Ligar `AdaptiveTier` à projeção (troca vetorizado → JIT) | só se T5 mostrar ganho ≥ 1,3x | T5 |
-| T7 | Revisor independente (Fable novo + Codex) | somente leitura | Auditoria do `unsafe` do JIT e dos números de T5 | defeitos confirmados corrigidos | T5 |
+| T2 ✅ | Haiku `jit-codegen` | `engine/src/jit.rs` | Int64/Float64, literais, `Add/Sub/Mul`, `Neg`, `Cast Int64→Float64`, comparações → Boolean. `Div/Mod/And/Or/Case/InList/Utf8` ficam não suportados | `cargo test jit` + clippy | T1 |
+| T3 ✅ | Haiku `jit-diff` | `engine/tests/jit_diff.rs` | Testes diferenciais JIT × `eval` com expressões aleatórias, NULLs, extremos de i64, NaN, lotes de 0/1/8191 linhas | ≥ 2000 casos suportados, 0 divergências | T2 |
+| T4 ✅ | Haiku `jit-bench` | `engine/src/bin/h1a.rs` | Mede `T_comp`, `t_vec`, `t_jit` por tupla em grade de ECI × N; localiza o cruzamento real; grava CSV | roda em release; saídas JIT = eval antes de cronometrar | T1 |
+| T5 ✅ | Fable (orquestrador) | `docs/RESULTS-H1A.md` | Executa T4 pós-merge, aplica benchmark-checklist, veredito por critério de H1a | cada número com método e limite declarado | T2, T3, T4 |
+| T6 ⏸ | Haiku, **condicional** | `engine/src/exec.rs` | Ligar `AdaptiveTier` à projeção (troca vetorizado → JIT) | só se T5 mostrar ganho ≥ 1,3x | T5 |
+| T7 ✅ | Revisor independente (Fable novo + Gemini Argon; Codex só leu `jit.rs`) | somente leitura | Auditoria do `unsafe` do JIT e dos números de T5 | defeitos confirmados corrigidos | T5 |
 
 ## Regras para os agentes
 
@@ -35,3 +35,8 @@ Cranelift **0.138**: `load`/`store` recebem `MemFlagsData::trusted()`; usar `ish
 - Sem dependências novas. Commit local na própria branch; nunca `git push`.
 - O orquestrador mescla e roda `cargo test`, clippy e fmt antes de aceitar: relatório de agente não é evidência.
 - Duas falhas seguidas no mesmo conserto → parar e pedir segunda opinião (regra anti-loop).
+
+## Estado (2026-11-24)
+
+T1–T5 e T7 concluídas; resultado em `docs/RESULTS-H1A.md`. T4b (baseline justo do avaliador) foi acrescentada durante a execução.
+T6 **não iniciada**: o ganho só apareceu com ≥ 7 operadores; decisão pendente do dono do projeto.

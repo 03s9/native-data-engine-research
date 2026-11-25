@@ -961,3 +961,42 @@ fn harness_detects_a_wrong_kernel() {
     let f_kernel = compile(&f_wrong).expect("supported");
     assert!(diff_case(&f_claimed, &f_kernel, &batch).is_err());
 }
+
+/// Regression: cranelift-jit does not unmap code pages on drop; CompiledKernel must free them.
+#[test]
+#[cfg(target_os = "macos")]
+fn dropped_kernels_release_their_code_pages() {
+    fn rss_kb() -> u64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps runs");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("rss is a number")
+    }
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, false),
+    ]);
+    let e = binary(
+        col(&schema, "a").unwrap(),
+        BinaryOp::Add,
+        col(&schema, "b").unwrap(),
+    )
+    .unwrap();
+    for _ in 0..200 {
+        drop(compile(&e).unwrap());
+    }
+    let before = rss_kb();
+    for _ in 0..20_000 {
+        drop(compile(&e).unwrap());
+    }
+    let grown = rss_kb().saturating_sub(before);
+    // The leak was 16 kB per compile (320 MB here); allow 40 MB of allocator noise.
+    assert!(
+        grown < 40_000,
+        "RSS grew {grown} kB over 20000 compile+drop cycles"
+    );
+}

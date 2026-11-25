@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 type KernelFn = unsafe extern "C" fn(*const *const u8, usize, *mut u8);
 
 pub struct CompiledKernel {
-    // Owns the executable memory `func` points into; must outlive every call.
-    _module: JITModule,
+    // Owns the executable memory `func` points into. `Some` until Drop, which frees it.
+    module: Option<JITModule>,
     func: KernelFn,
     /// Batch column index and type for each kernel input slot, in first-use order.
     inputs: Vec<(usize, DataType)>,
@@ -345,12 +345,23 @@ pub fn compile(expr: &Expr) -> Result<CompiledKernel> {
     // KernelFn signature (three pointer-sized params, no return); `module` is kept alive in the struct.
     let func = unsafe { std::mem::transmute::<*const u8, KernelFn>(code) };
     Ok(CompiledKernel {
-        _module: module,
+        module: Some(module),
         func,
         inputs,
         out_type,
         compile_time: start.elapsed(),
     })
+}
+
+impl Drop for CompiledKernel {
+    fn drop(&mut self) {
+        if let Some(module) = self.module.take() {
+            // SAFETY: `func` is private and only called through `&self` in `invoke`, so no call can
+            // be executing or start after `drop(&mut self)`; nothing else holds pointers into the module.
+            // Without this, cranelift-jit 0.138 leaks the code pages (its Drop does not unmap them).
+            unsafe { module.free_memory() };
+        }
+    }
 }
 
 impl CompiledKernel {

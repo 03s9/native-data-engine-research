@@ -7,3 +7,6 @@
 - `engine/src/sort.rs` → `Batch::slice` compartilha buffers Utf8 e `byte_size` cobra o buffer inteiro; ordenação externa usa `slice_compact` para não estourar o orçamento.
 - fluxo agentes → worktrees do `git worktree` nascem em `main` antigo: agente precisa `git merge --ff-only feat/engine-mvp` antes; branch pode ser emendada após o merge (re-mesclar).
 - validação Fable → join Grace dimensionava partição por bytes em disco, não em memória (Memory espúrio c/ Utf8); corrigido medindo bytes compactados. Orçamento não cobre entradas/saídas (README declara).
+- [JIT::Cranelift0.138] -> load/store usam `MemFlagsData::trusted()`; `ishl_imm_u`/`iadd_imm_u`; `finalize(target_config)`; `JITModule` não desmapeia no Drop: chamar `free_memory()` (vazava 16 kB/compilação) (fonte: engine/src/jit.rs, 2026-11-24)
+- [Bench::H1a] -> JIT escalar tem piso ~0,55 ns/tupla; avaliador ~0,15–0,23 ns/tupla/operador; JIT só ganha com ≥ 4 operadores e só paga compilação em 200k com ≥ 7; ECI não prevê (fonte: docs/RESULTS-H1A.md, 2026-11-24)
+- [Bench::Baseline] -> medir JIT contra avaliador que clona colunas inflou o ganho de ~1,05x para 1,8x; conferir o baseline antes de medir (fonte: commit 2366d10, 2026-11-24)

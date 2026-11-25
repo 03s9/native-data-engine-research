@@ -1,6 +1,6 @@
 # Motor nativo de dados — Fase 2: endurecimento adversarial da especificação
 
-Este repositório registra a proposta técnica de um motor analítico nativo em **Rust 1.75+**. A Fase 1 formalizou a arquitetura, o modelo de custo e o protocolo de avaliação. A **Fase 2 de revisão adversarial e remediações de baixo nível** foi concluída e aprovada no Gate 2: o crate de verificação passou em **23/23 testes** (`cargo test --offline --locked`). Um **MVP executável** do motor vive em [`engine/`](engine/) (ver abaixo). Backends JIT (Cranelift/LLVM) e as suítes TPC-H/ClickBench continuam **fora de escopo** e não foram implementados. A RFC permanece em estado *Authoritative Draft*.
+Este repositório registra a proposta técnica de um motor analítico nativo em **Rust 1.75+**. A Fase 1 formalizou a arquitetura, o modelo de custo e o protocolo de avaliação. A **Fase 2 de revisão adversarial e remediações de baixo nível** foi concluída e aprovada no Gate 2: o crate de verificação passou em **23/23 testes** (`cargo test --offline --locked`). Um **MVP executável** do motor vive em [`engine/`](engine/) (ver abaixo). Há um JIT Cranelift experimental (só expressões aritméticas, fora do executor). LLVM e as suítes TPC-H/ClickBench continuam **fora de escopo**. A RFC permanece em estado *Authoritative Draft*.
 
 ## Decisões arquiteturais
 
@@ -47,20 +47,21 @@ Crate Rust `native_engine` sem Arrow: colunas próprias (`Vec` tipado + validade
 | `sched` | Morsels em pool Rayon dedicado (ordem preservada, erro aborta) e ponte Tokio→Rayon com contrapressão. Só filtro e projeção usam morsels; a ponte só é exercitada pelos próprios testes |
 | `memory`, `spill`, `sort` | Orçamento hierárquico, arquivos de spill, ordenação externa |
 | `aggregate`, `join` | Agregação hash (sem spill) e hash join com partições Grace em disco; sob skew extremo cai em nested-loop em blocos e sempre retorna (resultado ou erro `Memory` se uma única linha não cabe no orçamento) |
-| `cost` | Modelo `N_crossover`, ECI e tier adaptativo (apenas política; **sem codegen JIT**) |
+| `cost` | Modelo `N_crossover`, ECI e tier adaptativo (apenas política, não ligada ao executor) |
+| `jit`, `bin/h1a` | JIT Cranelift para aritmética e comparações Int64/Float64 (laço escalar fundido) e o binário de medição da hipótese H1a. Resultado em [RESULTS-H1A.md](docs/RESULTS-H1A.md): H1a como escrita não se sustenta neste laptop. O executor não usa o JIT |
 | `simd` | Kernels NEON/AVX2 com referência scalar e testes diferenciais (AVX2 **não compilado nem executado** neste Mac). Usado só por `ndq bench`; o avaliador não os chama |
 | `catalog`, `exec`, `bin/ndq` | CSV, executor do plano lógico e CLI |
 
 ```bash
 cd engine
-cargo test                      # 195 unitários + 32 e2e + 1 doctest
+cargo test                      # 222 unitários + 32 e2e + 7 diferenciais do JIT + 1 doctest
 cargo clippy --all-targets -- -D warnings
 cargo run --release --bin ndq -- demo     # 1M linhas: filtro, group-by, join+top5
 cargo run --release --bin ndq -- csv dados.csv --where valor ">" 10 --select id,valor --limit 20
 cargo run --release --bin ndq -- bench    # microbenchmarks de laptop
 ```
 
-**Limites declarados.** O orçamento de memória cobre só a tabela de build do join e o buffer de runs da ordenação; entradas, lado de probe e saídas são `Vec<Batch>` totalmente materializados e não contabilizados, então o spill **não limita** o uso total de RAM. Agregação, join e ordenação são single-thread. Ordenação externa abre todos os runs de uma vez (sem merge multi-passada; pode estourar `ulimit -n` com dados ~250x o orçamento). Inteiros somam com wrap silencioso. Não há parser SQL (planos são montados em Rust; o `ndq csv` aceita só um filtro simples). Agregação não faz spill. Cranelift/LLVM, TPC-H SF100 e ClickBench 100M não foram feitos. `ndq bench` mede um único laptop e **não valida** H1a/H1b, H2 nem H3; no Apple Silicon medido, o kernel NEON `gt_i64` empatou com o scalar autovetorizado (0,97x).
+**Limites declarados.** O orçamento de memória cobre só a tabela de build do join e o buffer de runs da ordenação; entradas, lado de probe e saídas são `Vec<Batch>` totalmente materializados e não contabilizados, então o spill **não limita** o uso total de RAM. Agregação, join e ordenação são single-thread. Ordenação externa abre todos os runs de uma vez (sem merge multi-passada; pode estourar `ulimit -n` com dados ~250x o orçamento). Inteiros somam com wrap silencioso. Não há parser SQL (planos são montados em Rust; o `ndq csv` aceita só um filtro simples). Agregação não faz spill. LLVM, TPC-H SF100 e ClickBench 100M não foram feitos; o JIT Cranelift não está ligado ao executor. `ndq bench` mede um único laptop e **não valida** H1a/H1b, H2 nem H3; no Apple Silicon medido, o kernel NEON `gt_i64` empatou com o scalar autovetorizado (0,97x).
 
 ## Próximos marcos
 
