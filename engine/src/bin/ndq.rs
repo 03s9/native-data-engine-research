@@ -5,6 +5,7 @@
 //! no new dependencies.
 
 use std::hint::black_box;
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,10 +42,11 @@ EXIT CODES:
     1  runtime error (I/O, plan or execution failure)
     2  usage error";
 
-/// Usage errors exit 2; runtime errors exit 1.
+/// Usage errors exit 2; runtime errors exit 1. `PipeClosed` (stdout reader went away, e.g. `| head`) exits 0.
 enum Failure {
     Usage(String),
     Run(String),
+    PipeClosed,
 }
 
 impl From<EngineError> for Failure {
@@ -53,12 +55,22 @@ impl From<EngineError> for Failure {
     }
 }
 
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            Failure::PipeClosed
+        } else {
+            Failure::Run(e.to_string())
+        }
+    }
+}
+
 type CliResult = std::result::Result<(), Failure>;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match dispatch(&args) {
-        Ok(()) => 0,
+        Ok(()) | Err(Failure::PipeClosed) => 0,
         Err(Failure::Usage(msg)) => {
             eprintln!("ndq: {msg}\nRun 'ndq --help' for usage.");
             2
@@ -94,7 +106,9 @@ fn dispatch(args: &[String]) -> CliResult {
 fn no_extra_args(name: &str, rest: &[String]) -> CliResult {
     match rest.first() {
         None => Ok(()),
-        Some(extra) => Err(Failure::Usage(format!("'{name}' takes no arguments, got '{extra}'"))),
+        Some(extra) => Err(Failure::Usage(format!(
+            "'{name}' takes no arguments, got '{extra}'"
+        ))),
     }
 }
 
@@ -106,13 +120,20 @@ fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
-fn exec_context() -> ExecContext {
-    ExecContext {
+fn exec_context() -> std::result::Result<ExecContext, Failure> {
+    let spill_dir = std::env::temp_dir().join("ndq-spill");
+    std::fs::create_dir_all(&spill_dir).map_err(|e| {
+        Failure::Run(format!(
+            "cannot create spill dir {}: {e}",
+            spill_dir.display()
+        ))
+    })?;
+    Ok(ExecContext {
         threads: default_threads(),
         morsel_rows: CHUNK_ROWS,
         budget: MemoryBudget::new(4 << 30),
-        spill_dir: std::env::temp_dir().join("ndq-spill"),
-    }
+        spill_dir,
+    })
 }
 
 /// Deterministic LCG (Knuth MMIX constants). Same seed, same data, on every run.
@@ -120,7 +141,10 @@ struct Lcg(u64);
 
 impl Lcg {
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         self.0 >> 33
     }
 
@@ -186,7 +210,10 @@ fn build_orders(rng: &mut Lcg, schema: &SchemaRef) -> Result<Vec<Batch>> {
 fn build_customers(schema: &SchemaRef) -> Result<Batch> {
     let ids: Vec<i64> = (0..CUSTOMER_ROWS as i64).collect();
     let names: Vec<String> = ids.iter().map(|i| format!("customer_{i:05}")).collect();
-    Batch::try_new(schema.clone(), vec![Column::from_i64(ids), Column::from_strs(&names)])
+    Batch::try_new(
+        schema.clone(),
+        vec![Column::from_i64(ids), Column::from_strs(&names)],
+    )
 }
 
 fn scan(table: &str, schema: &SchemaRef) -> Arc<LogicalPlan> {
@@ -199,7 +226,11 @@ fn scan(table: &str, schema: &SchemaRef) -> Arc<LogicalPlan> {
 }
 
 fn agg(func: AggFunc, expr: Option<Expr>, output_type: DataType) -> AggExpr {
-    AggExpr { func, expr, output_type }
+    AggExpr {
+        func,
+        expr,
+        output_type,
+    }
 }
 
 fn demo() -> CliResult {
@@ -228,7 +259,11 @@ fn demo() -> CliResult {
     ]));
     let filtered = Arc::new(LogicalPlan::Filter {
         input: scan("orders", &orders_schema),
-        predicate: binary(col(&orders_schema, "amount")?, BinaryOp::Gt, lit(ScalarValue::Int64(900)))?,
+        predicate: binary(
+            col(&orders_schema, "amount")?,
+            BinaryOp::Gt,
+            lit(ScalarValue::Int64(900)),
+        )?,
     });
     let qa = Arc::new(LogicalPlan::Projection {
         input: filtered,
@@ -251,16 +286,29 @@ fn demo() -> CliResult {
         input: scan("orders", &orders_schema),
         group_exprs: vec![col(&orders_schema, "region")?],
         agg_exprs: vec![
-            agg(AggFunc::Sum, Some(col(&orders_schema, "amount")?), DataType::Int64),
+            agg(
+                AggFunc::Sum,
+                Some(col(&orders_schema, "amount")?),
+                DataType::Int64,
+            ),
             agg(AggFunc::Count, None, DataType::Int64),
-            agg(AggFunc::Avg, Some(col(&orders_schema, "amount")?), DataType::Float64),
+            agg(
+                AggFunc::Avg,
+                Some(col(&orders_schema, "amount")?),
+                DataType::Float64,
+            ),
         ],
         schema: region_schema,
     });
 
     // (c) orders JOIN customers ON cust, GROUP BY name, ORDER BY total DESC LIMIT 5
     let joined_schema = schema_ref(Schema::new(
-        orders_schema.fields.iter().chain(customers_schema.fields.iter()).cloned().collect(),
+        orders_schema
+            .fields
+            .iter()
+            .chain(customers_schema.fields.iter())
+            .cloned()
+            .collect(),
     ));
     let top_schema = schema_ref(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -271,14 +319,21 @@ fn demo() -> CliResult {
         left: scan("orders", &orders_schema),
         right: scan("customers", &customers_schema),
         join_type: JoinType::Inner,
-        on: vec![(col(&orders_schema, "cust")?, col(&customers_schema, "cust")?)],
+        on: vec![(
+            col(&orders_schema, "cust")?,
+            col(&customers_schema, "cust")?,
+        )],
         schema: joined_schema.clone(),
     });
     let grouped = Arc::new(LogicalPlan::Aggregate {
         input: join,
         group_exprs: vec![col(&joined_schema, "name")?],
         agg_exprs: vec![
-            agg(AggFunc::Sum, Some(col(&joined_schema, "amount")?), DataType::Int64),
+            agg(
+                AggFunc::Sum,
+                Some(col(&joined_schema, "amount")?),
+                DataType::Int64,
+            ),
             agg(AggFunc::Count, None, DataType::Int64),
         ],
         schema: top_schema.clone(),
@@ -291,13 +346,20 @@ fn demo() -> CliResult {
             nulls_first: false,
         }],
     });
-    let qc = Arc::new(LogicalPlan::Limit { input: sorted, skip: 0, fetch: Some(5) });
+    let qc = Arc::new(LogicalPlan::Limit {
+        input: sorted,
+        skip: 0,
+        fetch: Some(5),
+    });
 
-    let ctx = exec_context();
+    let ctx = exec_context()?;
     let queries = [
         ("a) filter + project: amount > 900", qa),
         ("b) group by region: sum, count, avg(amount)", qb),
-        ("c) join orders-customers, group by name, top 5 by total", qc),
+        (
+            "c) join orders-customers, group by name, top 5 by total",
+            qc,
+        ),
     ];
     for (title, plan) in &queries {
         let t = Instant::now();
@@ -305,14 +367,19 @@ fn demo() -> CliResult {
         let elapsed = ms_since(t);
         let total_rows: usize = out.iter().map(|b| b.num_rows).sum();
         println!("\n== {title}");
-        print_table(&plan.schema(), &out, PRINT_ROWS);
+        print_table(&plan.schema(), &out, PRINT_ROWS, &mut io::stdout().lock())?;
         println!("rows: {total_rows} (showing up to {PRINT_ROWS}), elapsed: {elapsed:.2} ms");
     }
     Ok(())
 }
 
-/// Aligned text table of at most `max_rows` rows.
-fn print_table(schema: &Schema, batches: &[Batch], max_rows: usize) {
+/// Aligned text table of at most `max_rows` rows. Write errors are returned so a closed pipe is not a panic.
+fn print_table(
+    schema: &Schema,
+    batches: &[Batch],
+    max_rows: usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let headers: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
     let mut rows: Vec<Vec<String>> = Vec::new();
     'outer: for b in batches {
@@ -337,12 +404,21 @@ fn print_table(schema: &Schema, batches: &[Batch], max_rows: usize) {
             .collect::<Vec<_>>()
             .join("  ")
     };
-    println!("{}", fmt_row(&headers));
-    println!("{}", widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("  "));
+    writeln!(out, "{}", fmt_row(&headers))?;
+    writeln!(
+        out,
+        "{}",
+        widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("  ")
+    )?;
     for r in &rows {
         let cells: Vec<&str> = r.iter().map(String::as_str).collect();
-        println!("{}", fmt_row(&cells));
+        writeln!(out, "{}", fmt_row(&cells))?;
     }
+    Ok(())
 }
 
 fn format_scalar(v: &ScalarValue) -> String {
@@ -372,14 +448,27 @@ fn parse_csv_args(args: &[String]) -> std::result::Result<CsvArgs, String> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--where" => match (it.next(), it.next(), it.next()) {
-                (Some(c), Some(op), Some(v)) => filter = Some((c.clone(), parse_op(op)?, v.clone())),
-                _ => return Err("--where needs three values: <col> <op> <literal>".into()),
-            },
+            "--where" => {
+                if filter.is_some() {
+                    return Err("only one --where is supported".into());
+                }
+                match (it.next(), it.next(), it.next()) {
+                    (Some(c), Some(op), Some(v)) => {
+                        filter = Some((c.clone(), parse_op(op)?, v.clone()))
+                    }
+                    _ => return Err("--where needs three values: <col> <op> <literal>".into()),
+                }
+            }
             "--select" => {
-                let v = it.next().ok_or("--select needs a comma-separated column list")?;
-                let cols: Vec<String> =
-                    v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+                let v = it
+                    .next()
+                    .ok_or("--select needs a comma-separated column list")?;
+                let cols: Vec<String> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
                 if cols.is_empty() {
                     return Err("--select needs at least one column name".into());
                 }
@@ -402,7 +491,12 @@ fn parse_csv_args(args: &[String]) -> std::result::Result<CsvArgs, String> {
         }
     }
     let path = path.ok_or("missing <file.csv>")?;
-    Ok(CsvArgs { path, filter, select, limit })
+    Ok(CsvArgs {
+        path,
+        filter,
+        select,
+        limit,
+    })
 }
 
 fn parse_op(op: &str) -> std::result::Result<BinaryOp, String> {
@@ -413,7 +507,11 @@ fn parse_op(op: &str) -> std::result::Result<BinaryOp, String> {
         "<=" => BinaryOp::LtEq,
         ">" => BinaryOp::Gt,
         ">=" => BinaryOp::GtEq,
-        other => return Err(format!("unsupported operator '{other}' (use = != < <= > >=)")),
+        other => {
+            return Err(format!(
+                "unsupported operator '{other}' (use = != < <= > >=)"
+            ))
+        }
     })
 }
 
@@ -439,7 +537,10 @@ fn csv(rest: &[String]) -> CliResult {
         let lhs = col(&schema, name).map_err(|e| Failure::Usage(e.to_string()))?;
         let rhs = parse_literal(value, lhs.return_type()).map_err(Failure::Usage)?;
         let predicate = binary(lhs, *op, lit(rhs))?;
-        plan = Arc::new(LogicalPlan::Filter { input: plan, predicate });
+        plan = Arc::new(LogicalPlan::Filter {
+            input: plan,
+            predicate,
+        });
     }
     if let Some(names) = &a.select {
         let mut exprs = Vec::with_capacity(names.len());
@@ -456,15 +557,21 @@ fn csv(rest: &[String]) -> CliResult {
         });
     }
     if let Some(n) = a.limit {
-        plan = Arc::new(LogicalPlan::Limit { input: plan, skip: 0, fetch: Some(n) });
+        plan = Arc::new(LogicalPlan::Limit {
+            input: plan,
+            skip: 0,
+            fetch: Some(n),
+        });
     }
 
     let t = Instant::now();
-    let out = execute(plan.as_ref(), &catalog, &exec_context())?;
+    let out = execute(plan.as_ref(), &catalog, &exec_context()?)?;
     let elapsed = ms_since(t);
-    print_table(&plan.schema(), &out, usize::MAX);
     let total_rows: usize = out.iter().map(|b| b.num_rows).sum();
-    println!("rows: {total_rows}, elapsed: {elapsed:.2} ms");
+    let mut stdout = BufWriter::new(io::stdout().lock());
+    print_table(&plan.schema(), &out, usize::MAX, &mut stdout)?;
+    writeln!(stdout, "rows: {total_rows}, elapsed: {elapsed:.2} ms")?;
+    stdout.flush()?;
     Ok(())
 }
 
@@ -487,7 +594,10 @@ struct Stats {
 
 fn stats_from(mut ms: Vec<f64>) -> Stats {
     ms.sort_by(f64::total_cmp);
-    Stats { min_ms: ms[0], median_ms: ms[ms.len() / 2] }
+    Stats {
+        min_ms: ms[0],
+        median_ms: ms[ms.len() / 2],
+    }
 }
 
 /// One untimed warm-up, then `RUNS` timed calls. The output is kept alive past the timer
@@ -518,11 +628,19 @@ fn print_stats(label: &str, rows: usize, s: Stats) {
 }
 
 fn print_stats_header() {
-    println!("{:<26} {:>11} {:>11} {:>14}", "case", "min ms", "median ms", "tuples/s");
+    println!(
+        "{:<26} {:>11} {:>11} {:>14}",
+        "case", "min ms", "median ms", "tuples/s"
+    );
 }
 
 fn int_schema(names: &[&str]) -> SchemaRef {
-    schema_ref(Schema::new(names.iter().map(|n| Field::new(n, DataType::Int64, false)).collect()))
+    schema_ref(Schema::new(
+        names
+            .iter()
+            .map(|n| Field::new(n, DataType::Int64, false))
+            .collect(),
+    ))
 }
 
 fn bench_simd(values: &[i64]) -> Result<(Stats, Stats)> {
@@ -532,7 +650,9 @@ fn bench_simd(values: &[i64]) -> Result<(Stats, Stats)> {
     gt_i64(values, THRESHOLD, &mut check_a);
     gt_i64_scalar(values, THRESHOLD, &mut check_b);
     if check_a != check_b {
-        return Err(EngineError::Plan("gt_i64 disagrees with gt_i64_scalar".into()));
+        return Err(EngineError::Plan(
+            "gt_i64 disagrees with gt_i64_scalar".into(),
+        ));
     }
 
     let mut out = vec![false; n];
@@ -550,7 +670,11 @@ fn bench_simd(values: &[i64]) -> Result<(Stats, Stats)> {
 fn hand_expr(a: &[i64], b: &[i64], c: &[i64], d: &[i64]) -> Vec<i64> {
     let mut out = Vec::with_capacity(a.len());
     for (((&a, &b), &c), &d) in a.iter().zip(b).zip(c).zip(d) {
-        out.push(a.wrapping_add(b).wrapping_mul(c).wrapping_sub(d.wrapping_mul(2)));
+        out.push(
+            a.wrapping_add(b)
+                .wrapping_mul(c)
+                .wrapping_sub(d.wrapping_mul(2)),
+        );
     }
     out
 }
@@ -569,13 +693,21 @@ fn bench_eval(a: &[i64], b: &[i64], c: &[i64], d: &[i64]) -> Result<(Stats, Stat
     )?;
     let sum_ab = binary(col(&schema, "a")?, BinaryOp::Add, col(&schema, "b")?)?;
     let prod = binary(sum_ab, BinaryOp::Mul, col(&schema, "c")?)?;
-    let d2 = binary(col(&schema, "d")?, BinaryOp::Mul, lit(ScalarValue::Int64(2)))?;
+    let d2 = binary(
+        col(&schema, "d")?,
+        BinaryOp::Mul,
+        lit(ScalarValue::Int64(2)),
+    )?;
     let expr = binary(prod, BinaryOp::Sub, d2)?;
 
     let want = hand_expr(a, b, c, d);
     match &eval(&expr, &batch)?.values {
         Values::Int64(got) if *got == want => {}
-        _ => return Err(EngineError::Plan("vectorized eval disagrees with hand loop".into())),
+        _ => {
+            return Err(EngineError::Plan(
+                "vectorized eval disagrees with hand loop".into(),
+            ))
+        }
     }
 
     let vectorized = sample(|| eval(&expr, &batch))?;
@@ -588,7 +720,9 @@ fn bench_scaling(values: Vec<i64>) -> Result<Vec<(usize, Stats)>> {
     let batch = Batch::try_new(int_schema(&["v"]), vec![Column::from_i64(values)])?;
     let filter_op = |m: &Batch| -> Result<Batch> {
         let Values::Int64(v) = &m.columns[0].values else {
-            return Err(EngineError::Type("filter scaling expects an Int64 column".into()));
+            return Err(EngineError::Type(
+                "filter scaling expects an Int64 column".into(),
+            ));
         };
         let mut mask = vec![false; v.len()];
         gt_i64(v, THRESHOLD, &mut mask);
@@ -628,16 +762,24 @@ fn bench() -> CliResult {
     print_stats_header();
     print_stats("gt_i64 (dispatched)", SIMD_ROWS, simd);
     print_stats("gt_i64_scalar", SIMD_ROWS, scalar);
-    println!("speedup (median): {:.2}x", scalar.median_ms / simd.median_ms);
+    println!(
+        "speedup (median): {:.2}x",
+        scalar.median_ms / simd.median_ms
+    );
     drop(simd_values);
 
-    let cols: Vec<Vec<i64>> = (0..4).map(|_| (0..EVAL_ROWS).map(|_| rng.below(1000)).collect()).collect();
+    let cols: Vec<Vec<i64>> = (0..4)
+        .map(|_| (0..EVAL_ROWS).map(|_| rng.below(1000)).collect())
+        .collect();
     let (vectorized, hand) = bench_eval(&cols[0], &cols[1], &cols[2], &cols[3])?;
     println!("\n== eval ((a + b) * c) - (d * 2): 4 arithmetic nodes, {EVAL_ROWS} rows");
     print_stats_header();
     print_stats("vectorized eval", EVAL_ROWS, vectorized);
     print_stats("hand-written loop", EVAL_ROWS, hand);
-    println!("ratio (median): {:.2}x", vectorized.median_ms / hand.median_ms);
+    println!(
+        "ratio (median): {:.2}x",
+        vectorized.median_ms / hand.median_ms
+    );
 
     let scale_values: Vec<i64> = (0..SCALE_ROWS).map(|_| rng.below(1_000_000)).collect();
     let scaling = bench_scaling(scale_values)?;
@@ -648,7 +790,10 @@ fn bench() -> CliResult {
         print_stats(&format!("threads = {threads}"), SCALE_ROWS, *s);
     }
     for (threads, s) in &scaling {
-        println!("threads = {threads}: speedup vs 1 thread (median) {:.2}x", base / s.median_ms);
+        println!(
+            "threads = {threads}: speedup vs 1 thread (median) {:.2}x",
+            base / s.median_ms
+        );
     }
 
     let vec_ns = vectorized.median_ms * 1e6 / EVAL_ROWS as f64;

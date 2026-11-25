@@ -31,6 +31,8 @@ fn parse_table(text: &str, batch_rows: usize) -> Result<(SchemaRef, Vec<Batch>)>
     if batch_rows == 0 {
         return Err(EngineError::Plan("load_csv batch_rows must be > 0".into()));
     }
+    // Excel and other editors write a UTF-8 byte order mark; it is not part of the first header name.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut records = parse_csv(text)?.into_iter();
     let header = records.next().ok_or_else(|| EngineError::Io("missing header row".into()))?;
     let ncols = header.fields.len();
@@ -61,7 +63,9 @@ fn parse_table(text: &str, batch_rows: usize) -> Result<(SchemaRef, Vec<Batch>)>
                 }
                 any_value = true;
                 all_int = all_int && v.parse::<i64>().is_ok();
-                all_float = all_float && is_float_literal(v);
+                // An integer literal outside i64 must not become Float64 (that loses precision): it makes the column text.
+                let overflowing_int = is_integer_literal(v) && v.parse::<i64>().is_err();
+                all_float = all_float && !overflowing_int && is_float_literal(v);
                 all_bool = all_bool && (v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false"));
             }
             let dt = if !any_value {
@@ -110,6 +114,12 @@ fn build_column(dt: DataType, cells: &[&str]) -> Column {
     } else {
         col.with_validity(validity)
     }
+}
+
+/// Optional sign followed by one or more ASCII digits and nothing else.
+fn is_integer_literal(s: &str) -> bool {
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Shape check (optional sign, digits with optional fraction, optional exponent) that also parses as f64.
@@ -227,4 +237,62 @@ fn parse_csv(text: &str) -> Result<Vec<Record>> {
         }
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ScalarValue;
+
+    fn table(text: &str) -> (SchemaRef, Vec<Batch>) {
+        parse_table(text, 1024).expect("csv parses")
+    }
+
+    fn cells(batches: &[Batch]) -> Vec<ScalarValue> {
+        batches.iter().flat_map(|b| (0..b.num_rows).map(move |i| b.row(i)[0].clone())).collect()
+    }
+
+    #[test]
+    fn leading_utf8_bom_is_not_part_of_first_header_name() {
+        let (sch, b) = table("\u{feff}id,name\n1,a\n");
+        let names: Vec<&str> = sch.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "name"]);
+        assert_eq!(sch.fields[0].data_type, DataType::Int64);
+        assert_eq!(cells(&b), vec![ScalarValue::Int64(1)]);
+    }
+
+    #[test]
+    fn integers_outside_i64_range_make_column_utf8_with_exact_digits() {
+        let (sch, b) = table("n\n1\n9223372036854775808\n");
+        assert_eq!(sch.fields[0].data_type, DataType::Utf8);
+        assert_eq!(
+            cells(&b),
+            vec![ScalarValue::Utf8("1".into()), ScalarValue::Utf8("9223372036854775808".into())]
+        );
+
+        let (neg, _) = table("n\n-9223372036854775809\n2.5\n");
+        assert_eq!(neg.fields[0].data_type, DataType::Utf8);
+    }
+
+    #[test]
+    fn i64_boundary_values_still_infer_int64() {
+        let (sch, b) = table("n\n-9223372036854775808\n9223372036854775807\n");
+        assert_eq!(sch.fields[0].data_type, DataType::Int64);
+        assert_eq!(cells(&b), vec![ScalarValue::Int64(i64::MIN), ScalarValue::Int64(i64::MAX)]);
+    }
+
+    #[test]
+    fn decimals_and_exponents_stay_float64() {
+        let (sch, b) = table("x\n1\n2.5\n1e3\n-4.25E-2\n");
+        assert_eq!(sch.fields[0].data_type, DataType::Float64);
+        assert_eq!(
+            cells(&b),
+            vec![
+                ScalarValue::Float64(1.0),
+                ScalarValue::Float64(2.5),
+                ScalarValue::Float64(1000.0),
+                ScalarValue::Float64(-0.0425),
+            ]
+        );
+    }
 }
