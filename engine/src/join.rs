@@ -118,25 +118,27 @@ enum Side {
     Right,
 }
 
-/// A join input: in-memory batches or one spilled partition file.
+/// A join input: in-memory batches or one spilled partition file. A file carries the in-memory byte measure
+/// of its rows, taken when it was written (see `data_bytes`).
 #[derive(Clone, Copy)]
 enum Source<'a> {
     Mem(&'a [Batch]),
-    File(&'a SpillFile),
+    File(&'a SpillFile, usize),
 }
 
 impl Source<'_> {
     fn rows(&self) -> usize {
         match self {
             Source::Mem(b) => b.iter().map(|x| x.num_rows).sum(),
-            Source::File(f) => f.num_rows(),
+            Source::File(f, _) => f.num_rows(),
         }
     }
 
+    /// In-memory bytes of the rows once compacted: the measure the build reservation is derived from.
     fn bytes(&self) -> usize {
         match self {
-            Source::Mem(b) => b.iter().map(Batch::byte_size).sum(),
-            Source::File(f) => f.bytes_on_disk() as usize,
+            Source::Mem(b) => b.iter().map(data_bytes).sum(),
+            Source::File(_, bytes) => *bytes,
         }
     }
 
@@ -148,7 +150,7 @@ impl Source<'_> {
                 }
                 Ok(())
             }
-            Source::File(file) => {
+            Source::File(file, _) => {
                 let mut reader = file.reader()?;
                 while let Some(b) = reader.next_batch()? {
                     f(&b)?;
@@ -187,24 +189,25 @@ impl Join<'_> {
             return self.chunked(l, r, usize::MAX);
         }
         if depth >= MAX_DEPTH {
-            // Fallback: nested loop over build chunks sized to the budget. Always terminates.
-            let per_row = (est / r.rows().max(1)).max(1);
-            return self.chunked(l, r, (avail / per_row).max(1));
+            // Fallback: nested loop over build chunks, each at most half the budget by measured bytes. A single
+            // row is always attempted, so Memory is returned only when one row cannot fit at all.
+            return self.chunked(l, r, (avail / 2).max(1));
         }
         let lparts = self.partition(l, Side::Left, depth + 1)?;
         let rparts = self.partition(r, Side::Right, depth + 1)?;
         let parent_rows = r.rows();
-        for (lp, rp) in lparts.iter().zip(&rparts) {
+        for ((lp, lb), (rp, rb)) in lparts.iter().zip(&rparts) {
             // Re-partitioning moved no rows out of the build side: this key set cannot be split by hash.
             let next = if rp.num_rows() == parent_rows { MAX_DEPTH } else { depth + 1 };
-            self.join_pair(Source::File(lp), Source::File(rp), next)?;
+            self.join_pair(Source::File(lp, *lb), Source::File(rp, *rb), next)?;
         }
         Ok(())
     }
 
-    /// Splits `src` into PARTITIONS spill files by a depth-seeded hash of the join key. NULL-key rows go to
-    /// partition 0 on both sides (they never match, so placement is irrelevant to the result).
-    fn partition(&mut self, src: Source, side: Side, seed: usize) -> Result<Vec<SpillFile>> {
+    /// Splits `src` into PARTITIONS spill files by a depth-seeded hash of the join key, each with its measured
+    /// in-memory bytes. NULL-key rows go to partition 0 on both sides (they never match, so placement is
+    /// irrelevant to the result).
+    fn partition(&mut self, src: Source, side: Side, seed: usize) -> Result<Vec<(SpillFile, usize)>> {
         let schema = match side {
             Side::Left => self.left_schema.clone(),
             Side::Right => self.right_schema.clone(),
@@ -213,6 +216,7 @@ impl Join<'_> {
             .map(|_| SpillWriter::create(self.spill_dir, schema.clone()))
             .collect::<Result<Vec<_>>>()?;
         self.stats.spill_files += PARTITIONS;
+        let mut bytes = vec![0usize; PARTITIONS];
         let on = self.on;
         let exprs: Vec<&Expr> = on.iter().map(|(l, r)| if side == Side::Left { l } else { r }).collect();
         src.for_each(&mut |b: &Batch| {
@@ -227,33 +231,49 @@ impl Join<'_> {
                 let p = if encode_key(&keys, i, &mut buf) { partition_of(&buf, seed) } else { 0 };
                 buckets[p].push(i);
             }
-            for (w, idx) in writers.iter_mut().zip(&buckets) {
+            for ((w, idx), nb) in writers.iter_mut().zip(&buckets).zip(bytes.iter_mut()) {
                 if !idx.is_empty() {
-                    w.write(&b.take(idx))?;
+                    let part = b.take(idx);
+                    *nb += data_bytes(&part);
+                    w.write(&part)?;
                 }
             }
             Ok(())
         })?;
-        writers.into_iter().map(SpillWriter::finish).collect()
+        writers.into_iter().zip(bytes).map(|(w, nb)| w.finish().map(|f| (f, nb))).collect()
     }
 
-    /// Joins `l` with `r` in build chunks of at most `rows_per_chunk` right rows.
-    fn chunked(&mut self, l: Source, r: Source, rows_per_chunk: usize) -> Result<()> {
+    /// Joins `l` with `r` in build chunks. A chunk takes right rows while their measured bytes, plus hash
+    /// overhead, stay within `target_bytes`. The first row of a chunk is always taken.
+    fn chunked(&mut self, l: Source, r: Source, target_bytes: usize) -> Result<()> {
         let needs_left_pass = matches!(self.jt, JoinType::Left | JoinType::Full | JoinType::Semi | JoinType::Anti);
         let mut bits = if needs_left_pass { vec![false; l.rows()] } else { Vec::new() };
+        let kcost = ENTRY_OVERHEAD + KEY_BYTES * self.on.len();
         let mut pending: Vec<Batch> = Vec::new();
         let mut pending_rows = 0usize;
+        let mut pending_cost = 0usize;
         let mut chunks = 0usize;
         r.for_each(&mut |b: &Batch| {
             let mut off = 0;
             while off < b.num_rows {
-                let take = (rows_per_chunk - pending_rows).min(b.num_rows - off);
-                pending.push(b.slice(off, take));
-                pending_rows += take;
-                off += take;
-                if pending_rows == rows_per_chunk {
+                let mut end = off;
+                while end < b.num_rows {
+                    let cost = row_data_bytes(b, end) + kcost;
+                    if pending_rows > 0 && pending_cost + cost > target_bytes {
+                        break;
+                    }
+                    pending_cost += cost;
+                    pending_rows += 1;
+                    end += 1;
+                }
+                if end > off {
+                    pending.push(compact_slice(b, off, end - off));
+                }
+                off = end;
+                if off < b.num_rows {
                     let parts = std::mem::take(&mut pending);
                     pending_rows = 0;
+                    pending_cost = 0;
                     self.run_chunk(l, &parts, &mut bits)?;
                     chunks += 1;
                 }
@@ -335,6 +355,7 @@ struct Table {
 
 impl Table {
     fn build(build: Batch, on: &[(Expr, Expr)], budget: &Arc<MemoryBudget>) -> Result<Table> {
+        // `build` is compacted by the caller, so byte_size counts only the rows it holds.
         let est = build.byte_size() + build.num_rows * (ENTRY_OVERHEAD + KEY_BYTES * on.len());
         let res = budget.try_reserve(est)?;
         let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
@@ -421,6 +442,53 @@ pub(crate) fn encode_key(cols: &[Column], row: usize, buf: &mut Vec<u8>) -> bool
         }
     }
     all_valid
+}
+
+/// Bytes one row costs once its batch is compacted, as `Batch::byte_size` counts it. A string costs its
+/// 16-byte view plus its bytes when longer than 12 (shorter strings are inline). Each column is charged one
+/// validity byte as an upper bound, since `Batch::concat` may add a validity mask.
+fn row_data_bytes(b: &Batch, i: usize) -> usize {
+    b.columns
+        .iter()
+        .map(|c| {
+            1 + match &c.values {
+                Values::Bool(_) => 1,
+                Values::Int64(_) | Values::Float64(_) => 8,
+                Values::Utf8(s) => {
+                    let v = &s.views[i];
+                    16 + if v.len > 12 { v.len as usize } else { 0 }
+                }
+            }
+        })
+        .sum()
+}
+
+/// `row_data_bytes` summed over every row of `b`.
+fn data_bytes(b: &Batch) -> usize {
+    (0..b.num_rows).map(|i| row_data_bytes(b, i)).sum()
+}
+
+/// Copies rows `start..start + len` with their string bytes, so the result shares no parent string buffer.
+fn compact_slice(batch: &Batch, start: usize, len: usize) -> Batch {
+    let end = start + len;
+    let columns = batch
+        .columns
+        .iter()
+        .map(|c| {
+            let values = match &c.values {
+                Values::Bool(v) => Values::Bool(v[start..end].to_vec()),
+                Values::Int64(v) => Values::Int64(v[start..end].to_vec()),
+                Values::Float64(v) => Values::Float64(v[start..end].to_vec()),
+                Values::Utf8(sv) => {
+                    let strs: Vec<&str> = (start..end).map(|i| sv.get(i)).collect();
+                    Values::Utf8(StringViews::from_strs(&strs))
+                }
+            };
+            let validity = c.validity.as_ref().map(|m| m[start..end].to_vec());
+            Column { values, validity }
+        })
+        .collect();
+    Batch { schema: batch.schema.clone(), columns, num_rows: len }
 }
 
 fn partition_of(key: &[u8], seed: usize) -> usize {
@@ -838,5 +906,165 @@ mod tests {
             .expect("skewed full join did not terminate within 20 seconds")
             .unwrap();
         assert_eq!(n, 10 + 500);
+    }
+
+    /// Right side with a Utf8 payload column: `rk` Int64, `rp` Utf8.
+    fn str_side_schema() -> Schema {
+        Schema::new(vec![f("rk", DataType::Int64), f("rp", DataType::Utf8)])
+    }
+
+    /// Output of a join between (lk, lv) and (rk, rp).
+    fn str_out_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            f("lk", DataType::Int64),
+            f("lv", DataType::Int64),
+            f("rk", DataType::Int64),
+            f("rp", DataType::Utf8),
+        ]))
+    }
+
+    fn on_lk_rk() -> Vec<(Expr, Expr)> {
+        vec![(col(&left_schema(), "lk").unwrap(), col(&str_side_schema(), "rk").unwrap())]
+    }
+
+    /// Sorted rendering of every row, so results compare regardless of batch layout.
+    fn sorted_debug(batches: &[Batch]) -> Vec<String> {
+        let mut rows: Vec<String> = batches
+            .iter()
+            .flat_map(|b| (0..b.num_rows).map(move |i| format!("{:?}", b.row(i))))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Left: keys [7, 8]. Right: `right_rows` rows all keyed 7, payload `payload(i)`, split into batches of `split` rows.
+    fn skew_inputs(right_rows: usize, split: usize, payload: &dyn Fn(usize) -> String) -> (Vec<Batch>, Vec<Batch>) {
+        let left = vec![side(&[Some(7), Some(8)], &[0, 1], &left_schema())];
+        let rs = str_side_schema();
+        let mut right = Vec::new();
+        let mut start = 0;
+        while start < right_rows {
+            let end = (start + split).min(right_rows);
+            let strs: Vec<String> = (start..end).map(payload).collect();
+            right.push(batch(&rs, vec![Column::from_i64(vec![7; end - start]), Column::from_strs(&strs)]));
+            start = end;
+        }
+        (left, right)
+    }
+
+    /// Runs `body` on a worker thread and fails the test if it does not finish within 30 seconds.
+    /// Panics inside `body` propagate to the test.
+    fn with_watchdog(name: &str, body: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            body();
+            let _ = tx.send(());
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("{name} did not finish within 30 seconds"),
+            _ => {
+                if let Err(p) = worker.join() {
+                    std::panic::resume_unwind(p);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_utf8_build_side_spills_and_matches_in_memory() {
+        let n = 16_000usize;
+        let keys_v: Vec<i64> = (0..n as i64).collect();
+        let ls = left_schema();
+        let mut rfields = vec![f("rk", DataType::Int64)];
+        rfields.extend((0..10).map(|i| f(&format!("r{i}"), DataType::Utf8)));
+        let rs = Schema::new(rfields);
+        let mut rcols = vec![Column::from_i64(keys_v.clone())];
+        rcols.extend((0..10).map(|_| Column::from_strs(&vec!["x"; n])));
+        let left = vec![side(&keys(&keys_v), &keys_v, &ls)];
+        let right = vec![batch(&rs, rcols)];
+        let mut ofields = ls.fields.clone();
+        ofields.extend(rs.fields.clone());
+        let out = Arc::new(Schema::new(ofields));
+        let on = vec![(col(&ls, "lk").unwrap(), col(&rs, "rk").unwrap())];
+        let want = sorted_debug(&hash_join(left.clone(), right.clone(), Inner, &on, out.clone(), &big(), &tmp()).unwrap());
+        assert_eq!(want.len(), n);
+        for budget in [150_000, 200_000, 250_000] {
+            let tiny = MemoryBudget::new(budget);
+            let got = hash_join(left.clone(), right.clone(), Inner, &on, out.clone(), &tiny, &tmp())
+                .unwrap_or_else(|e| panic!("budget {budget}: {e:?}"));
+            assert_eq!(sorted_debug(&got), want, "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn skewed_utf8_single_batch_spills_and_matches_in_memory() {
+        with_watchdog("skewed utf8 join", || {
+            let (left, right) = skew_inputs(10_000, 10_000, &|i| format!("{:0>100}", i));
+            for jt in [Inner, Left] {
+                let on = on_lk_rk();
+                let want = sorted_debug(&hash_join(left.clone(), right.clone(), jt, &on, str_out_schema(), &big(), &tmp()).unwrap());
+                assert_eq!(want.len(), if jt == Inner { 10_000 } else { 10_001 }, "{jt:?} in-memory count");
+                for budget in [800_000, 200_000] {
+                    let tiny = MemoryBudget::new(budget);
+                    let got = hash_join(left.clone(), right.clone(), jt, &on, str_out_schema(), &tiny, &tmp())
+                        .unwrap_or_else(|e| panic!("{jt:?} budget {budget}: {e:?}"));
+                    assert_eq!(sorted_debug(&got), want, "{jt:?} budget {budget}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn skewed_short_utf8_pre_split_batches_spill_and_match_in_memory() {
+        with_watchdog("skewed short utf8 join", || {
+            let (left, right) = skew_inputs(10_000, 100, &|_| "x".to_string());
+            for jt in [Inner, Left] {
+                let on = on_lk_rk();
+                let want = sorted_debug(&hash_join(left.clone(), right.clone(), jt, &on, str_out_schema(), &big(), &tmp()).unwrap());
+                for budget in [50_000, 200_000, 800_000] {
+                    let tiny = MemoryBudget::new(budget);
+                    let got = hash_join(left.clone(), right.clone(), jt, &on, str_out_schema(), &tiny, &tmp())
+                        .unwrap_or_else(|e| panic!("{jt:?} budget {budget}: {e:?}"));
+                    assert_eq!(sorted_debug(&got), want, "{jt:?} budget {budget}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn small_utf8_inputs_complete_at_tiny_budgets() {
+        let mut rng = StdRng::seed_from_u64(2024);
+        let on = on_lk_rk();
+        for case in 0..30 {
+            let nl = rng.gen_range(0..=400usize);
+            let nr = rng.gen_range(1..=400usize);
+            let lkeys: Vec<i64> = (0..nl).map(|_| rng.gen_range(0..20)).collect();
+            let lvals: Vec<i64> = (0..nl).map(|_| rng.gen_range(-1000..1000)).collect();
+            let rkeys: Vec<i64> = (0..nr).map(|_| rng.gen_range(0..20)).collect();
+            let rstrs: Vec<String> = (0..nr)
+                .map(|_| {
+                    let len = rng.gen_range(0..=60usize);
+                    (0..len).map(|_| char::from(rng.gen_range(b'a'..=b'z'))).collect()
+                })
+                .collect();
+            let left = vec![side(&keys(&lkeys), &lvals, &left_schema())];
+            let right = vec![batch(&str_side_schema(), vec![Column::from_i64(rkeys), Column::from_strs(&rstrs)])];
+            let want = sorted_debug(&hash_join(left.clone(), right.clone(), Inner, &on, str_out_schema(), &big(), &tmp()).unwrap());
+            let big_row = rstrs
+                .iter()
+                .map(|s| 8 + 16 + if s.len() > 12 { s.len() } else { 0 } + ENTRY_OVERHEAD + KEY_BYTES)
+                .max()
+                .unwrap_or(0);
+            let ok = hash_join(left.clone(), right.clone(), Inner, &on, str_out_schema(), &MemoryBudget::new(20_000), &tmp())
+                .unwrap_or_else(|e| panic!("case {case} budget 20000: {e:?}"));
+            assert_eq!(sorted_debug(&ok), want, "case {case} budget 20000");
+            match hash_join(left.clone(), right.clone(), Inner, &on, str_out_schema(), &MemoryBudget::new(6_000), &tmp()) {
+                Ok(got) => assert_eq!(sorted_debug(&got), want, "case {case} budget 6000"),
+                Err(EngineError::Memory { .. }) => {
+                    assert!(6_000 < big_row, "case {case}: Memory at 6000 though a build row costs {big_row}")
+                }
+                Err(e) => panic!("case {case} budget 6000: {e:?}"),
+            }
+        }
     }
 }
