@@ -30,6 +30,30 @@ enum Acc {
 impl Acc {
     fn new(agg: &AggExpr) -> Result<Acc> {
         let input_dt = agg.expr.as_ref().map(|e| e.return_type());
+        let acc = Acc::for_input(agg, input_dt)?;
+        let produced = acc.output_type(input_dt);
+        if produced != agg.output_type {
+            let input = input_dt.map_or("*".to_string(), |d| format!("{d:?}"));
+            return Err(EngineError::Type(format!(
+                "aggregate {:?} over {input} produces {produced:?}, but the plan declares {:?}",
+                agg.func, agg.output_type
+            )));
+        }
+        Ok(acc)
+    }
+
+    /// Output type of this state. `input_dt` is the aggregate's input type (`None` for COUNT(*)).
+    fn output_type(&self, input_dt: Option<DataType>) -> DataType {
+        match self {
+            Acc::Count(_) | Acc::SumI(..) => DataType::Int64,
+            Acc::SumF(..) | Acc::AvgF { .. } => DataType::Float64,
+            Acc::MinMaxI { .. } | Acc::MinMaxF { .. } | Acc::MinMaxB { .. } | Acc::MinMaxS { .. } => {
+                input_dt.expect("min/max always has an input")
+            }
+        }
+    }
+
+    fn for_input(agg: &AggExpr, input_dt: Option<DataType>) -> Result<Acc> {
         let acc = match (agg.func, input_dt) {
             (AggFunc::Count, _) => Acc::Count(vec![]),
             (AggFunc::Sum, Some(DataType::Int64)) => Acc::SumI(vec![], vec![]),
@@ -109,8 +133,14 @@ impl Acc {
                 }
             }
             (Acc::MinMaxF { min, v, has }, Values::Float64(x)) => {
+                // NaN is ignored unless it is the only non-null value seen: order independent.
                 let x = x[row];
-                if !has[g] || (*min && x < v[g]) || (!*min && x > v[g]) {
+                if x.is_nan() {
+                    if !has[g] {
+                        v[g] = x;
+                        has[g] = true;
+                    }
+                } else if !has[g] || v[g].is_nan() || (*min && x < v[g]) || (!*min && x > v[g]) {
                     v[g] = x;
                     has[g] = true;
                 }
@@ -173,7 +203,12 @@ impl Acc {
                 with_validity(Column::from_f64(vals), has)
             }
         };
-        debug_assert_eq!(col.data_type(), out_dt, "aggregate output type");
+        if col.data_type() != out_dt {
+            return Err(EngineError::Type(format!(
+                "aggregate produced {:?}, but the output schema declares {out_dt:?}",
+                col.data_type()
+            )));
+        }
         Ok(col)
     }
 }
@@ -504,6 +539,47 @@ mod tests {
         let out = run(vec![batch], &[g], &[agg(AggFunc::Sum, Some(v.clone()), DataType::Int64), agg(AggFunc::Max, Some(v), DataType::Int64)], out_schema(&[("g", DataType::Int64), ("s", DataType::Int64), ("m", DataType::Int64)])).unwrap();
         let n = ScalarValue::Null(DataType::Int64);
         assert_eq!(rows(&out), vec![vec![ScalarValue::Int64(1), n.clone(), n]]);
+    }
+
+    fn min_max_f64(vals: Column) -> Vec<ScalarValue> {
+        let s = sch(&[("f", DataType::Float64)]);
+        let f = col(&s, "f").unwrap();
+        let aggs = [agg(AggFunc::Min, Some(f.clone()), DataType::Float64), agg(AggFunc::Max, Some(f), DataType::Float64)];
+        let out = run(vec![input(&s, vec![vals])], &[], &aggs, out_schema(&[("mn", DataType::Float64), ("mx", DataType::Float64)])).unwrap();
+        rows(&out).remove(0)
+    }
+
+    #[test]
+    fn min_max_float_ignores_nan_in_every_position() {
+        let nan = f64::NAN;
+        let perms = [[nan, 1.0, 2.0], [nan, 2.0, 1.0], [1.0, nan, 2.0], [2.0, nan, 1.0], [1.0, 2.0, nan], [2.0, 1.0, nan]];
+        for p in perms {
+            let got = min_max_f64(Column::from_f64(p.to_vec()));
+            assert_eq!(got, vec![ScalarValue::Float64(1.0), ScalarValue::Float64(2.0)], "input {p:?}");
+        }
+    }
+
+    #[test]
+    fn min_max_float_all_nan_is_nan() {
+        let nan = f64::NAN;
+        for vals in [Column::from_f64(vec![nan, nan]), Column::from_f64(vec![nan, 5.0]).with_validity(vec![true, false])] {
+            for v in min_max_f64(vals) {
+                match v {
+                    ScalarValue::Float64(x) => assert!(x.is_nan(), "expected NaN, got {x}"),
+                    o => panic!("expected Float64, got {o:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sum_int_declared_as_float_is_type_error() {
+        let a = col(&sch(&[("a", DataType::Int64)]), "a").unwrap();
+        let err = run(one_int_col(Some(vec![Some(1), Some(2)])), &[], &[agg(AggFunc::Sum, Some(a), DataType::Float64)], out_schema(&[("s", DataType::Float64)])).unwrap_err();
+        match err {
+            EngineError::Type(msg) => assert!(msg.contains("Sum") && msg.contains("Int64") && msg.contains("Float64"), "{msg}"),
+            other => panic!("expected type error, got {other:?}"),
+        }
     }
 
     #[test]

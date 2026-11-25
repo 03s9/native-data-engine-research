@@ -7,34 +7,59 @@ use std::sync::Arc;
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct View {
-    pub len: u32,
-    pub data: [u8; 12],
+    pub(crate) len: u32,
+    pub(crate) data: [u8; 12],
 }
 
+/// Fields are crate-private so safe code outside the crate cannot forge views into arbitrary buffers.
+/// ```compile_fail
+/// let _ = native_engine::column::StringViews { views: vec![], buffers: vec![] };
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct StringViews {
-    pub views: Vec<View>,
-    pub buffers: Vec<Arc<Vec<u8>>>,
+    pub(crate) views: Vec<View>,
+    pub(crate) buffers: Vec<Arc<Vec<u8>>>,
 }
+
+/// Largest byte count one string buffer may hold: view offsets and lengths are u32.
+const MAX_BUFFER: usize = u32::MAX as usize;
 
 impl StringViews {
     pub fn from_strs<S: AsRef<str>>(items: &[S]) -> Self {
-        let mut buf: Vec<u8> = Vec::new();
+        Self::from_strs_with_limit(items, MAX_BUFFER)
+    }
+
+    /// Packs `items` into buffers of at most `limit` bytes. A new buffer starts when the current one
+    /// would exceed `limit`, so every offset and length fits in the view's u32 fields.
+    fn from_strs_with_limit<S: AsRef<str>>(items: &[S], limit: usize) -> Self {
+        assert!(limit <= MAX_BUFFER, "buffer limit {limit} exceeds u32::MAX");
+        let mut buffers: Vec<Vec<u8>> = vec![Vec::new()];
         let mut views = Vec::with_capacity(items.len());
         for s in items {
             let b = s.as_ref().as_bytes();
+            assert!(
+                b.len() <= limit,
+                "string of {} bytes exceeds the {limit}-byte buffer limit; a single string cannot span buffers",
+                b.len()
+            );
             let mut data = [0u8; 12];
             if b.len() <= 12 {
                 data[..b.len()].copy_from_slice(b);
             } else {
+                if buffers.last().is_some_and(|cur| cur.len() + b.len() > limit) {
+                    buffers.push(Vec::new());
+                }
+                let bi = buffers.len() - 1;
+                let bi32 = u32::try_from(bi).expect("more than u32::MAX string buffers");
+                let off = buffers[bi].len() as u32;
                 data[..4].copy_from_slice(&b[..4]);
-                data[4..8].copy_from_slice(&0u32.to_le_bytes());
-                data[8..12].copy_from_slice(&(buf.len() as u32).to_le_bytes());
-                buf.extend_from_slice(b);
+                data[4..8].copy_from_slice(&bi32.to_le_bytes());
+                data[8..12].copy_from_slice(&off.to_le_bytes());
+                buffers[bi].extend_from_slice(b);
             }
             views.push(View { len: b.len() as u32, data });
         }
-        StringViews { views, buffers: vec![Arc::new(buf)] }
+        StringViews { views, buffers: buffers.into_iter().map(Arc::new).collect() }
     }
 
     pub fn len(&self) -> usize {
@@ -54,7 +79,9 @@ impl StringViews {
             let off = u32::from_le_bytes(v.data[8..12].try_into().unwrap()) as usize;
             &self.buffers[bi][off..off + n]
         };
-        // SAFETY: every view is built from a &str (valid UTF-8) via from_strs/take/concat.
+        // SAFETY: invariant: the fields are pub(crate), so only crate code builds views, and every
+        // constructor copies bytes from a &str: from_strs_with_limit, take (shares buffers), concat
+        // (rebases buffer indices). A view's bytes lie inside its buffer and are valid UTF-8.
         unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 
@@ -277,6 +304,14 @@ impl Batch {
         Batch { schema, columns: cols.iter().map(|&i| self.columns[i].clone()).collect(), num_rows: self.num_rows }
     }
     pub fn concat(schema: SchemaRef, batches: &[Batch]) -> Result<Batch> {
+        let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();
+        if schema.fields.is_empty() {
+            // Zero-column batches carry only a row count; it must survive concatenation.
+            return Ok(Batch { schema, columns: vec![], num_rows: total_rows });
+        }
+        if batches.iter().any(|b| b.columns.is_empty() && b.num_rows > 0) {
+            return Err(EngineError::Plan("zero-column batch with rows cannot be concatenated into a schema with columns".into()));
+        }
         let non_empty: Vec<&Batch> = batches.iter().filter(|b| !b.columns.is_empty()).collect();
         if non_empty.is_empty() {
             return Ok(Batch { schema: schema.clone(), columns: schema.fields.iter().map(|f| empty_col(f.data_type)).collect(), num_rows: 0 });
@@ -335,6 +370,47 @@ mod tests {
         assert_eq!(c.get(1), ScalarValue::Utf8("hi".into()));
         assert_eq!(c.get(2), ScalarValue::Utf8("another long string past the inline limit".into()));
     }
+    #[test]
+    fn many_buffers_keep_every_string_under_small_limit() {
+        let strs: Vec<String> = (0..200)
+            .map(|i| if i % 5 == 0 { format!("s{i}") } else { format!("{i:0>width$}", width = 13 + i % 48) })
+            .collect();
+        let sv = StringViews::from_strs_with_limit(&strs, 64);
+        assert!(sv.buffers.len() > 1, "expected several buffers, got {}", sv.buffers.len());
+        for (i, s) in strs.iter().enumerate() {
+            assert_eq!(sv.get(i), s.as_str(), "row {i}");
+        }
+    }
+
+    #[test]
+    fn take_and_concat_round_trip_across_buffers() {
+        let strs: Vec<String> = (0..50).map(|i| format!("row-{i:0>20}")).collect();
+        let sv = StringViews::from_strs_with_limit(&strs, 64);
+        assert!(sv.buffers.len() > 1, "expected several buffers, got {}", sv.buffers.len());
+        let col = Column { values: Values::Utf8(sv), validity: None };
+        let idx: Vec<usize> = (0..50).rev().step_by(3).collect();
+        let joined = Column::concat(&[&col.take(&idx), &col]).unwrap();
+        let expected: Vec<String> = idx.iter().map(|&i| strs[i].clone()).chain(strs.iter().cloned()).collect();
+        for (i, s) in expected.iter().enumerate() {
+            assert_eq!(joined.get(i), ScalarValue::Utf8(s.clone()), "row {i}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the 64-byte buffer limit")]
+    fn string_longer_than_buffer_limit_panics() {
+        StringViews::from_strs_with_limit(&["x".repeat(65)], 64);
+    }
+
+    #[test]
+    fn zero_column_batches_keep_their_row_count() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![]));
+        let b = Batch { schema: schema.clone(), columns: vec![], num_rows: 3 };
+        assert_eq!(Batch::concat(schema.clone(), &[b.clone(), b.clone()]).unwrap().num_rows, 6);
+        assert_eq!(b.take(&[0, 2]).num_rows, 2);
+        assert_eq!(b.slice(1, 2).num_rows, 2);
+    }
+
     #[test]
     fn validity_survives_filter_and_concat() {
         let a = Column::from_i64(vec![1, 2, 3]).with_validity(vec![true, false, true]);
