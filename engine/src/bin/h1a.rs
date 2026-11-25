@@ -625,7 +625,7 @@ fn main() -> BoxResult<()> {
 
     println!("h1a: H1a measurement (docs/PLAN.md T4). Cranelift JIT vs vectorized eval.");
     println!(
-        "Scope: Int64 add chains only in this tree; other expressions are skipped by jit::supports. Does NOT address H1b (LLVM), H2 (x86/AVX-512) or H3."
+        "Scope: expressions jit::supports accepts (Int64/Float64 arithmetic and comparisons); others are skipped. Does NOT address H1b (LLVM), H2 (x86/AVX-512) or H3."
     );
     println!(
         "Machine: arch={} os={} logical_cpus={} | single laptop, single thread for all measured work",
