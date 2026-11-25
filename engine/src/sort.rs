@@ -479,6 +479,14 @@ mod tests {
     }
 
     #[test]
+    fn zero_column_batch_keeps_row_count_through_sort() {
+        let zero_cols: SchemaRef = Arc::new(Schema::new(vec![]));
+        let b = Batch { schema: zero_cols.clone(), columns: vec![], num_rows: 3 };
+        let out = sort_batches(vec![b], zero_cols, &[], &big_budget(), &spill_dir("zero_col"), 10).unwrap();
+        assert_eq!(out.iter().map(|b| b.num_rows).sum::<usize>(), 3);
+    }
+
+    #[test]
     fn empty_input_yields_no_batches() {
         let dir = spill_dir("empty");
         let out = sort_batches(vec![], schema(), &[sf(0, true, true)], &big_budget(), &dir, 10).unwrap();
