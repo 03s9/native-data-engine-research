@@ -44,23 +44,23 @@ Crate Rust `native_engine` sem Arrow: colunas próprias (`Vec` tipado + validade
 | Módulo | O que faz |
 | --- | --- |
 | `expr`, `eval` | AST tipada, inferência de tipos, avaliação vetorizada com lógica de 3 valores, otimizador de constantes |
-| `sched` | Morsels em pool Rayon dedicado (ordem preservada, erro aborta) e ponte Tokio→Rayon com contrapressão |
+| `sched` | Morsels em pool Rayon dedicado (ordem preservada, erro aborta) e ponte Tokio→Rayon com contrapressão. Só filtro e projeção usam morsels; a ponte só é exercitada pelos próprios testes |
 | `memory`, `spill`, `sort` | Orçamento hierárquico, arquivos de spill, ordenação externa |
-| `aggregate`, `join` | Agregação hash (sem spill) e hash join com partições Grace em disco, terminação garantida sob skew |
+| `aggregate`, `join` | Agregação hash (sem spill) e hash join com partições Grace em disco; sob skew extremo cai em nested-loop em blocos e sempre retorna (resultado ou erro `Memory` se uma única linha não cabe no orçamento) |
 | `cost` | Modelo `N_crossover`, ECI e tier adaptativo (apenas política; **sem codegen JIT**) |
-| `simd` | Kernels NEON/AVX2 com referência scalar e testes diferenciais (AVX2 **não compilado nem executado** neste Mac) |
+| `simd` | Kernels NEON/AVX2 com referência scalar e testes diferenciais (AVX2 **não compilado nem executado** neste Mac). Usado só por `ndq bench`; o avaliador não os chama |
 | `catalog`, `exec`, `bin/ndq` | CSV, executor do plano lógico e CLI |
 
 ```bash
 cd engine
-cargo test                      # 179 unitários + 26 e2e
+cargo test                      # 195 unitários + 32 e2e + 1 doctest
 cargo clippy --all-targets -- -D warnings
 cargo run --release --bin ndq -- demo     # 1M linhas: filtro, group-by, join+top5
 cargo run --release --bin ndq -- csv dados.csv --where valor ">" 10 --select id,valor --limit 20
 cargo run --release --bin ndq -- bench    # microbenchmarks de laptop
 ```
 
-**Limites declarados.** Não há parser SQL (planos são montados em Rust; o `ndq csv` aceita só um filtro simples). Agregação não faz spill. Cranelift/LLVM, TPC-H SF100 e ClickBench 100M não foram feitos. `ndq bench` mede um único laptop e **não valida** H1a/H1b, H2 nem H3; no Apple Silicon medido, o kernel NEON `gt_i64` empatou com o scalar autovetorizado (0,97x).
+**Limites declarados.** O orçamento de memória cobre só a tabela de build do join e o buffer de runs da ordenação; entradas, lado de probe e saídas são `Vec<Batch>` totalmente materializados e não contabilizados, então o spill **não limita** o uso total de RAM. Agregação, join e ordenação são single-thread. Ordenação externa abre todos os runs de uma vez (sem merge multi-passada; pode estourar `ulimit -n` com dados ~250x o orçamento). Inteiros somam com wrap silencioso. Não há parser SQL (planos são montados em Rust; o `ndq csv` aceita só um filtro simples). Agregação não faz spill. Cranelift/LLVM, TPC-H SF100 e ClickBench 100M não foram feitos. `ndq bench` mede um único laptop e **não valida** H1a/H1b, H2 nem H3; no Apple Silicon medido, o kernel NEON `gt_i64` empatou com o scalar autovetorizado (0,97x).
 
 ## Próximos marcos
 

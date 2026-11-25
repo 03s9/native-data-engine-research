@@ -6,3 +6,4 @@
 - `engine/` → MVP executável sem Arrow (colunas próprias); 179 unit + 26 e2e passam; JIT/TPC-H/ClickBench fora de escopo; AVX2 nunca compilado aqui; `gt_i64` NEON ≈ scalar (0,97x, laptop).
 - `engine/src/sort.rs` → `Batch::slice` compartilha buffers Utf8 e `byte_size` cobra o buffer inteiro; ordenação externa usa `slice_compact` para não estourar o orçamento.
 - fluxo agentes → worktrees do `git worktree` nascem em `main` antigo: agente precisa `git merge --ff-only feat/engine-mvp` antes; branch pode ser emendada após o merge (re-mesclar).
+- validação Fable → join Grace dimensionava partição por bytes em disco, não em memória (Memory espúrio c/ Utf8); corrigido medindo bytes compactados. Orçamento não cobre entradas/saídas (README declara).
