@@ -5,6 +5,8 @@
 //! CASE branches that are not selected for a row never raise it.
 //! Float64 -> Int64 casts truncate (Rust `as`: saturating, NaN -> 0). Utf8 -> numeric/bool
 //! casts return NULL on parse failure.
+//! Design: operator-at-a-time vectorized interpreter, one output vector per computed node. No expression
+//! fusion, SIMD intrinsics or codegen; this is the baseline the JIT is measured against.
 use std::borrow::Cow;
 
 use crate::column::{empty_col, schema_ref, Batch, Column, StringViews, Values};
@@ -81,6 +83,12 @@ pub fn case(c: Expr, t: Expr, e: Expr) -> Result<Expr> {
 
 /// Evaluate over every row of `batch`; result length == batch.num_rows.
 pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
+    eval_ref(expr, batch).map(Cow::into_owned)
+}
+
+/// Column references are borrowed from `batch`; every other node returns an owned vector.
+/// A literal operand of an Int64/Float64 operator is applied as a scalar, not broadcast.
+fn eval_ref<'a>(expr: &Expr, batch: &'a Batch) -> Result<Cow<'a, Column>> {
     let n = batch.num_rows;
     match expr {
         Expr::Column {
@@ -98,48 +106,73 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
                     c.data_type()
                 )));
             }
-            Ok(c.clone())
+            Ok(Cow::Borrowed(c))
         }
-        Expr::Literal(v) => Ok(broadcast(v, n)),
+        Expr::Literal(v) => Ok(Cow::Owned(broadcast(v, n))),
         Expr::Binary {
             left,
             op,
             right,
             return_type,
         } => {
-            let l = eval(left, batch)?;
-            let r = eval(right, batch)?;
-            expect_type(binary_cols(&l, *op, &r)?, *return_type)
+            let out = match (left.as_ref(), right.as_ref()) {
+                (l, Expr::Literal(v)) if !matches!(l, Expr::Literal(_)) => {
+                    let lc = eval_ref(l, batch)?;
+                    match scalar_op(&lc, *op, v, false)? {
+                        Some(out) => out,
+                        None => binary_cols(&lc, *op, &broadcast(v, n))?,
+                    }
+                }
+                (Expr::Literal(v), r) if !matches!(r, Expr::Literal(_)) => {
+                    let rc = eval_ref(r, batch)?;
+                    match scalar_op(&rc, *op, v, true)? {
+                        Some(out) => out,
+                        None => binary_cols(&broadcast(v, n), *op, &rc)?,
+                    }
+                }
+                _ => {
+                    let l = eval_ref(left, batch)?;
+                    let r = eval_ref(right, batch)?;
+                    binary_cols(&l, *op, &r)?
+                }
+            };
+            expect_type(out, *return_type).map(Cow::Owned)
         }
         Expr::Unary {
             op,
             expr: inner,
             return_type,
         } => {
-            let c = eval(inner, batch)?;
-            expect_type(unary_col(*op, &c)?, *return_type)
+            let c = eval_ref(inner, batch)?;
+            expect_type(unary_col(*op, &c)?, *return_type).map(Cow::Owned)
         }
         Expr::Cast {
             expr: inner,
             target_type,
-        } => cast_col(&eval(inner, batch)?, *target_type),
+        } => {
+            let c = eval_ref(inner, batch)?;
+            if c.data_type() == *target_type {
+                return Ok(c);
+            }
+            cast_col(&c, *target_type).map(Cow::Owned)
+        }
         Expr::InList {
             expr: inner,
             list,
             negated,
         } => {
-            let x = eval(inner, batch)?;
+            let x = eval_ref(inner, batch)?;
             // x IN (a, b) == (x = a) OR (x = b), with the same 3VL as the OR operator.
             let mut acc = Column::from_bool(vec![false; n]);
             for item in list {
-                let y = eval(item, batch)?;
+                let y = eval_ref(item, batch)?;
                 let eq = binary_cols(&x, BinaryOp::Eq, &y)?;
                 acc = logic(BinaryOp::Or, &acc, &eq)?;
             }
             if *negated {
                 acc = unary_col(UnaryOp::Not, &acc)?;
             }
-            Ok(acc)
+            Ok(Cow::Owned(acc))
         }
         Expr::Case {
             condition,
@@ -147,7 +180,7 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
             else_expr,
             return_type,
         } => {
-            let c = eval(condition, batch)?;
+            let c = eval_ref(condition, batch)?;
             let cb = as_bools(&c)?;
             // Each branch runs only on the rows that select it, so a branch error on another row is never raised.
             let mut idx_t = Vec::new();
@@ -161,11 +194,11 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
             }
             let t = branch(then_expr, batch, &idx_t, *return_type)?;
             if idx_e.is_empty() {
-                return Ok(t);
+                return Ok(Cow::Owned(t));
             }
             let e = branch(else_expr, batch, &idx_e, *return_type)?;
             if idx_t.is_empty() {
-                return Ok(e);
+                return Ok(Cow::Owned(e));
             }
             let combined = Column::concat(&[&t, &e])?;
             let mut pos = vec![0usize; n];
@@ -175,14 +208,14 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
             for (k, &i) in idx_e.iter().enumerate() {
                 pos[i] = idx_t.len() + k;
             }
-            Ok(combined.take(&pos))
+            Ok(Cow::Owned(combined.take(&pos)))
         }
     }
 }
 
 /// Boolean predicate -> row mask; NULL counts as false (SQL WHERE semantics).
 pub fn eval_predicate(expr: &Expr, batch: &Batch) -> Result<Vec<bool>> {
-    let c = eval(expr, batch)?;
+    let c = eval_ref(expr, batch)?;
     let b = as_bools(&c)?;
     Ok(b.iter()
         .enumerate()
@@ -457,26 +490,31 @@ fn int_arith(op: BinaryOp, a: &[i64], b: &[i64], validity: Option<&[bool]>) -> R
         BinaryOp::Div | BinaryOp::Mod => {
             let mut out = Vec::with_capacity(a.len());
             for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
-                if y == 0 {
-                    if valid_at(validity, i) {
-                        let what = if op == BinaryOp::Div {
-                            "integer division"
-                        } else {
-                            "integer remainder"
-                        };
-                        return Err(EngineError::Arithmetic(format!("{what} by zero")));
-                    }
-                    // NULL divisor: the slot is NULL, so its value is a placeholder.
-                    out.push(0);
-                } else if op == BinaryOp::Div {
-                    out.push(x.wrapping_div(y));
-                } else {
-                    out.push(x.wrapping_rem(y));
-                }
+                out.push(int_div_rem(op, x, y, valid_at(validity, i))?);
             }
             out
         }
         _ => return Err(type_err(format!("{op:?} is not arithmetic"))),
+    })
+}
+
+/// `/` or `%` on one row. A zero divisor is an error only on a valid row; a NULL slot holds a placeholder.
+fn int_div_rem(op: BinaryOp, x: i64, y: i64, valid: bool) -> Result<i64> {
+    if y == 0 {
+        if valid {
+            let what = if op == BinaryOp::Div {
+                "integer division"
+            } else {
+                "integer remainder"
+            };
+            return Err(EngineError::Arithmetic(format!("{what} by zero")));
+        }
+        return Ok(0);
+    }
+    Ok(if op == BinaryOp::Div {
+        x.wrapping_div(y)
+    } else {
+        x.wrapping_rem(y)
     })
 }
 
@@ -489,6 +527,138 @@ fn float_arith(op: BinaryOp, a: &[f64], b: &[f64]) -> Result<Vec<f64>> {
         BinaryOp::Mod => zip_map(a, b, |x, y| x % y),
         _ => return Err(type_err(format!("{op:?} is not arithmetic"))),
     })
+}
+
+fn is_comparison(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+    )
+}
+
+/// Applies `f` per row with the scalar on the side the literal sat on. The side test is loop-invariant.
+fn scalar_map<A: Copy, T: Copy, O>(
+    a: &[A],
+    conv: impl Fn(A) -> T + Copy,
+    s: T,
+    lit_left: bool,
+    f: impl Fn(T, T) -> O + Copy,
+) -> Vec<O> {
+    if lit_left {
+        a.iter().map(|&x| f(s, conv(x))).collect()
+    } else {
+        a.iter().map(|&x| f(conv(x), s)).collect()
+    }
+}
+
+fn int_scalar(
+    op: BinaryOp,
+    a: &[i64],
+    s: i64,
+    lit_left: bool,
+    validity: Option<&[bool]>,
+) -> Result<Vec<i64>> {
+    let id = |x: i64| x;
+    Ok(match op {
+        BinaryOp::Add => scalar_map(a, id, s, lit_left, i64::wrapping_add),
+        BinaryOp::Sub => scalar_map(a, id, s, lit_left, i64::wrapping_sub),
+        BinaryOp::Mul => scalar_map(a, id, s, lit_left, i64::wrapping_mul),
+        BinaryOp::Div | BinaryOp::Mod => {
+            let mut out = Vec::with_capacity(a.len());
+            for (i, &x) in a.iter().enumerate() {
+                let (p, q) = if lit_left { (s, x) } else { (x, s) };
+                out.push(int_div_rem(op, p, q, valid_at(validity, i))?);
+            }
+            out
+        }
+        _ => return Err(type_err(format!("{op:?} is not arithmetic"))),
+    })
+}
+
+fn float_scalar<A: Copy>(
+    op: BinaryOp,
+    a: &[A],
+    conv: impl Fn(A) -> f64 + Copy,
+    s: f64,
+    lit_left: bool,
+) -> Result<Vec<f64>> {
+    Ok(match op {
+        BinaryOp::Add => scalar_map(a, conv, s, lit_left, |x, y| x + y),
+        BinaryOp::Sub => scalar_map(a, conv, s, lit_left, |x, y| x - y),
+        BinaryOp::Mul => scalar_map(a, conv, s, lit_left, |x, y| x * y),
+        BinaryOp::Div => scalar_map(a, conv, s, lit_left, |x, y| x / y),
+        BinaryOp::Mod => scalar_map(a, conv, s, lit_left, |x, y| x % y),
+        _ => return Err(type_err(format!("{op:?} is not arithmetic"))),
+    })
+}
+
+/// Float64 kernel for an Int64 or Float64 column against a scalar. `conv` widens the column side
+/// the same way the promotion does, so no widened copy of the column is built.
+fn float_operand<A: Copy>(
+    op: BinaryOp,
+    a: &[A],
+    conv: impl Fn(A) -> f64 + Copy,
+    s: f64,
+    lit_left: bool,
+) -> Result<Values> {
+    if is_comparison(op) {
+        Ok(Values::Bool(cmp_scalar(op, a, conv, s, lit_left)))
+    } else {
+        Ok(Values::Float64(float_scalar(op, a, conv, s, lit_left)?))
+    }
+}
+
+fn cmp_scalar<A: Copy, T: PartialOrd + Copy>(
+    op: BinaryOp,
+    a: &[A],
+    conv: impl Fn(A) -> T + Copy,
+    s: T,
+    lit_left: bool,
+) -> Vec<bool> {
+    match op {
+        BinaryOp::Eq => scalar_map(a, conv, s, lit_left, |x, y| x == y),
+        BinaryOp::NotEq => scalar_map(a, conv, s, lit_left, |x, y| x != y),
+        BinaryOp::Lt => scalar_map(a, conv, s, lit_left, |x, y| x < y),
+        BinaryOp::LtEq => scalar_map(a, conv, s, lit_left, |x, y| x <= y),
+        BinaryOp::Gt => scalar_map(a, conv, s, lit_left, |x, y| x > y),
+        BinaryOp::GtEq => scalar_map(a, conv, s, lit_left, |x, y| x >= y),
+        _ => unreachable!("cmp_scalar is only called with comparison operators"),
+    }
+}
+
+/// Column (op) scalar, or scalar (op) column when `lit_left`, for Int64 and Float64 operands.
+/// Returns `None` for any other operand types so the caller broadcasts and keeps its type errors.
+fn scalar_op(
+    c: &Column,
+    op: BinaryOp,
+    lit: &ScalarValue,
+    lit_left: bool,
+) -> Result<Option<Column>> {
+    if matches!(op, BinaryOp::And | BinaryOp::Or) {
+        return Ok(None);
+    }
+    let values = match (&c.values, lit) {
+        (Values::Int64(a), ScalarValue::Int64(s)) if is_comparison(op) => {
+            Values::Bool(cmp_scalar(op, a, |x| x, *s, lit_left))
+        }
+        (Values::Int64(a), ScalarValue::Int64(s)) => {
+            Values::Int64(int_scalar(op, a, *s, lit_left, c.validity.as_deref())?)
+        }
+        (Values::Int64(a), ScalarValue::Float64(s)) => {
+            float_operand(op, a, |x| x as f64, *s, lit_left)?
+        }
+        (Values::Float64(a), ScalarValue::Int64(s)) => {
+            float_operand(op, a, |x| x, *s as f64, lit_left)?
+        }
+        (Values::Float64(a), ScalarValue::Float64(s)) => float_operand(op, a, |x| x, *s, lit_left)?,
+        _ => return Ok(None),
+    };
+    Ok(Some(finish(values, c.validity.clone())))
 }
 
 fn compare(l: &Column, op: BinaryOp, r: &Column) -> Result<Column> {
@@ -928,6 +1098,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(run(&e, &b), vec![nul(DataType::Int64), int(3)]);
+    }
+
+    #[test]
+    fn scalar_operands_match_broadcast_columns() {
+        let a = nullable_i64(
+            vec![5, -3, 0, 7, 2, 0],
+            vec![true, true, false, true, true, true],
+        );
+        let fa = Column::from_f64(vec![1.5, -2.0, 0.0, 4.25, -0.5, 3.0]);
+        let (schema, batch) = setup(vec![
+            ("a", a),
+            ("fa", fa),
+            ("k3", Column::from_i64(vec![3; 6])),
+            ("k0", Column::from_i64(vec![0; 6])),
+            ("kf", Column::from_f64(vec![2.5; 6])),
+        ]);
+        let ops = [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Mod,
+            BinaryOp::Eq,
+            BinaryOp::NotEq,
+            BinaryOp::Lt,
+            BinaryOp::LtEq,
+            BinaryOp::Gt,
+            BinaryOp::GtEq,
+        ];
+        let shown = |c: &Column| -> Vec<String> {
+            (0..c.len()).map(|i| format!("{:?}", c.get(i))).collect()
+        };
+        // The scalar path must match the same operator against a materialised constant column,
+        // including error and NULL behaviour, on either side of the operator.
+        for (lit_v, k) in [(int(3), "k3"), (int(0), "k0"), (flt(2.5), "kf")] {
+            for name in ["a", "fa"] {
+                for op in ops {
+                    for lit_left in [false, true] {
+                        let x = || col(&schema, name).unwrap();
+                        let kk = || col(&schema, k).unwrap();
+                        let (scalar, reference) = if lit_left {
+                            (binary(lit(lit_v.clone()), op, x()), binary(kk(), op, x()))
+                        } else {
+                            (binary(x(), op, lit(lit_v.clone())), binary(x(), op, kk()))
+                        };
+                        let got = eval(&scalar.unwrap(), &batch).map(|c| shown(&c));
+                        let want = eval(&reference.unwrap(), &batch).map(|c| shown(&c));
+                        assert_eq!(got, want, "{name} {op:?} {lit_v:?} lit_left={lit_left}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_zero_divisor_errors_only_on_valid_rows() {
+        let (schema, batch) = setup(vec![("a", nullable_i64(vec![5, 6], vec![false, false]))]);
+        let e = binary(col(&schema, "a").unwrap(), BinaryOp::Div, i(0)).unwrap();
+        assert_eq!(run(&e, &batch), vec![nul(DataType::Int64); 2]);
+
+        let (schema, batch) = setup(vec![("a", nullable_i64(vec![5, 6], vec![true, false]))]);
+        let e = binary(col(&schema, "a").unwrap(), BinaryOp::Mod, i(0)).unwrap();
+        assert!(eval(&e, &batch).is_err());
     }
 
     #[test]
