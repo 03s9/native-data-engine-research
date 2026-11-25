@@ -20,11 +20,28 @@ enum Acc {
     Count(Vec<i64>),
     SumI(Vec<i64>, Vec<bool>),
     SumF(Vec<f64>, Vec<bool>),
-    MinMaxI { min: bool, v: Vec<i64>, has: Vec<bool> },
-    MinMaxF { min: bool, v: Vec<f64>, has: Vec<bool> },
-    MinMaxB { min: bool, v: Vec<Option<bool>> },
-    MinMaxS { min: bool, v: Vec<Option<String>> },
-    AvgF { sum: Vec<f64>, cnt: Vec<i64> },
+    MinMaxI {
+        min: bool,
+        v: Vec<i64>,
+        has: Vec<bool>,
+    },
+    MinMaxF {
+        min: bool,
+        v: Vec<f64>,
+        has: Vec<bool>,
+    },
+    MinMaxB {
+        min: bool,
+        v: Vec<Option<bool>>,
+    },
+    MinMaxS {
+        min: bool,
+        v: Vec<Option<String>>,
+    },
+    AvgF {
+        sum: Vec<f64>,
+        cnt: Vec<i64>,
+    },
 }
 
 impl Acc {
@@ -47,9 +64,10 @@ impl Acc {
         match self {
             Acc::Count(_) | Acc::SumI(..) => DataType::Int64,
             Acc::SumF(..) | Acc::AvgF { .. } => DataType::Float64,
-            Acc::MinMaxI { .. } | Acc::MinMaxF { .. } | Acc::MinMaxB { .. } | Acc::MinMaxS { .. } => {
-                input_dt.expect("min/max always has an input")
-            }
+            Acc::MinMaxI { .. }
+            | Acc::MinMaxF { .. }
+            | Acc::MinMaxB { .. }
+            | Acc::MinMaxS { .. } => input_dt.expect("min/max always has an input"),
         }
     }
 
@@ -61,15 +79,28 @@ impl Acc {
             (AggFunc::Min | AggFunc::Max, Some(dt)) => {
                 let min = agg.func == AggFunc::Min;
                 match dt {
-                    DataType::Int64 => Acc::MinMaxI { min, v: vec![], has: vec![] },
-                    DataType::Float64 => Acc::MinMaxF { min, v: vec![], has: vec![] },
+                    DataType::Int64 => Acc::MinMaxI {
+                        min,
+                        v: vec![],
+                        has: vec![],
+                    },
+                    DataType::Float64 => Acc::MinMaxF {
+                        min,
+                        v: vec![],
+                        has: vec![],
+                    },
                     DataType::Boolean => Acc::MinMaxB { min, v: vec![] },
                     DataType::Utf8 => Acc::MinMaxS { min, v: vec![] },
                 }
             }
-            (AggFunc::Avg, Some(DataType::Int64 | DataType::Float64)) => Acc::AvgF { sum: vec![], cnt: vec![] },
+            (AggFunc::Avg, Some(DataType::Int64 | DataType::Float64)) => Acc::AvgF {
+                sum: vec![],
+                cnt: vec![],
+            },
             (func, dt) => {
-                return Err(EngineError::Type(format!("aggregate {func:?} not supported on {dt:?}")));
+                return Err(EngineError::Type(format!(
+                    "aggregate {func:?} not supported on {dt:?}"
+                )));
             }
         };
         Ok(acc)
@@ -181,8 +212,12 @@ impl Acc {
     fn finish(self, out_dt: DataType) -> Result<Column> {
         let col = match self {
             Acc::Count(c) => Column::from_i64(c),
-            Acc::SumI(v, h) | Acc::MinMaxI { v, has: h, .. } => with_validity(Column::from_i64(v), h),
-            Acc::SumF(v, h) | Acc::MinMaxF { v, has: h, .. } => with_validity(Column::from_f64(v), h),
+            Acc::SumI(v, h) | Acc::MinMaxI { v, has: h, .. } => {
+                with_validity(Column::from_i64(v), h)
+            }
+            Acc::SumF(v, h) | Acc::MinMaxF { v, has: h, .. } => {
+                with_validity(Column::from_f64(v), h)
+            }
             Acc::MinMaxB { v, .. } => {
                 let items: Vec<ScalarValue> = v
                     .into_iter()
@@ -199,7 +234,11 @@ impl Acc {
             }
             Acc::AvgF { sum, cnt } => {
                 let has: Vec<bool> = cnt.iter().map(|c| *c > 0).collect();
-                let vals: Vec<f64> = sum.iter().zip(&cnt).map(|(s, c)| if *c > 0 { s / *c as f64 } else { 0.0 }).collect();
+                let vals: Vec<f64> = sum
+                    .iter()
+                    .zip(&cnt)
+                    .map(|(s, c)| if *c > 0 { s / *c as f64 } else { 0.0 })
+                    .collect();
                 with_validity(Column::from_f64(vals), has)
             }
         };
@@ -227,8 +266,12 @@ fn with_validity(col: Column, has: Vec<bool>) -> Column {
 // shortcut: no spilling aggregation. Group table is charged to `budget` and Err(Memory) is returned
 // as-is; `spill_dir` is unused until a partitioned aggregate spill exists.
 pub fn hash_aggregate(
-    input: Vec<Batch>, group_exprs: &[Expr], aggs: &[AggExpr], schema: SchemaRef,
-    budget: &Arc<MemoryBudget>, _spill_dir: &Path,
+    input: Vec<Batch>,
+    group_exprs: &[Expr],
+    aggs: &[AggExpr],
+    schema: SchemaRef,
+    budget: &Arc<MemoryBudget>,
+    _spill_dir: &Path,
 ) -> Result<Vec<Batch>> {
     if schema.fields.len() != group_exprs.len() + aggs.len() {
         return Err(EngineError::Plan(format!(
@@ -259,7 +302,10 @@ pub fn hash_aggregate(
         if batch.num_rows == 0 {
             continue;
         }
-        let keys: Vec<Column> = group_exprs.iter().map(|e| eval(e, batch)).collect::<Result<_>>()?;
+        let keys: Vec<Column> = group_exprs
+            .iter()
+            .map(|e| eval(e, batch))
+            .collect::<Result<_>>()?;
         let agg_cols: Vec<Option<Column>> = aggs
             .iter()
             .map(|a| a.expr.as_ref().map(|e| eval(e, batch)).transpose())
@@ -311,7 +357,12 @@ mod tests {
     }
 
     fn sch(fields: &[(&str, DataType)]) -> Schema {
-        Schema::new(fields.iter().map(|(n, t)| Field::new(n, *t, true)).collect())
+        Schema::new(
+            fields
+                .iter()
+                .map(|(n, t)| Field::new(n, *t, true))
+                .collect(),
+        )
     }
 
     fn input(s: &Schema, cols: Vec<Column>) -> Batch {
@@ -319,11 +370,18 @@ mod tests {
     }
 
     fn rows(batches: &[Batch]) -> Vec<Vec<ScalarValue>> {
-        batches.iter().flat_map(|b| (0..b.num_rows).map(move |i| b.row(i))).collect()
+        batches
+            .iter()
+            .flat_map(|b| (0..b.num_rows).map(move |i| b.row(i)))
+            .collect()
     }
 
     fn agg(func: AggFunc, e: Option<Expr>, out: DataType) -> AggExpr {
-        AggExpr { func, expr: e, output_type: out }
+        AggExpr {
+            func,
+            expr: e,
+            output_type: out,
+        }
     }
 
     fn out_schema(fields: &[(&str, DataType)]) -> SchemaRef {
@@ -331,7 +389,10 @@ mod tests {
     }
 
     fn run(
-        batches: Vec<Batch>, groups: &[Expr], aggs: &[AggExpr], schema: SchemaRef,
+        batches: Vec<Batch>,
+        groups: &[Expr],
+        aggs: &[AggExpr],
+        schema: SchemaRef,
     ) -> Result<Vec<Batch>> {
         let budget = MemoryBudget::new(64 << 20);
         hash_aggregate(batches, groups, aggs, schema, &budget, &dir())
@@ -358,28 +419,52 @@ mod tests {
 
     #[test]
     fn count_star_no_groups() {
-        let out = run(one_int_col(Some(vec![Some(1), None, Some(3)])), &[], &[agg(AggFunc::Count, None, DataType::Int64)], out_schema(&[("c", DataType::Int64)])).unwrap();
+        let out = run(
+            one_int_col(Some(vec![Some(1), None, Some(3)])),
+            &[],
+            &[agg(AggFunc::Count, None, DataType::Int64)],
+            out_schema(&[("c", DataType::Int64)]),
+        )
+        .unwrap();
         assert_eq!(rows(&out), vec![vec![ScalarValue::Int64(3)]]);
     }
 
     #[test]
     fn count_expr_skips_nulls() {
         let a = col(&sch(&[("a", DataType::Int64)]), "a").unwrap();
-        let out = run(one_int_col(Some(vec![Some(1), None, Some(3), None])), &[], &[agg(AggFunc::Count, Some(a), DataType::Int64)], out_schema(&[("c", DataType::Int64)])).unwrap();
+        let out = run(
+            one_int_col(Some(vec![Some(1), None, Some(3), None])),
+            &[],
+            &[agg(AggFunc::Count, Some(a), DataType::Int64)],
+            out_schema(&[("c", DataType::Int64)]),
+        )
+        .unwrap();
         assert_eq!(rows(&out), vec![vec![ScalarValue::Int64(2)]]);
     }
 
     #[test]
     fn sum_int_ignores_nulls() {
         let a = col(&sch(&[("a", DataType::Int64)]), "a").unwrap();
-        let out = run(one_int_col(Some(vec![Some(1), None, Some(5)])), &[], &[agg(AggFunc::Sum, Some(a), DataType::Int64)], out_schema(&[("s", DataType::Int64)])).unwrap();
+        let out = run(
+            one_int_col(Some(vec![Some(1), None, Some(5)])),
+            &[],
+            &[agg(AggFunc::Sum, Some(a), DataType::Int64)],
+            out_schema(&[("s", DataType::Int64)]),
+        )
+        .unwrap();
         assert_eq!(rows(&out), vec![vec![ScalarValue::Int64(6)]]);
     }
 
     #[test]
     fn sum_int_wraps_on_overflow() {
         let a = col(&sch(&[("a", DataType::Int64)]), "a").unwrap();
-        let out = run(one_int_col(Some(vec![Some(i64::MAX), Some(1)])), &[], &[agg(AggFunc::Sum, Some(a), DataType::Int64)], out_schema(&[("s", DataType::Int64)])).unwrap();
+        let out = run(
+            one_int_col(Some(vec![Some(i64::MAX), Some(1)])),
+            &[],
+            &[agg(AggFunc::Sum, Some(a), DataType::Int64)],
+            out_schema(&[("s", DataType::Int64)]),
+        )
+        .unwrap();
         assert_eq!(rows(&out), vec![vec![ScalarValue::Int64(i64::MIN)]]);
     }
 
@@ -388,7 +473,13 @@ mod tests {
         let s = sch(&[("f", DataType::Float64)]);
         let col_f = Column::from_f64(vec![1.5, 0.0, 2.25]).with_validity(vec![true, false, true]);
         let f = col(&s, "f").unwrap();
-        let out = run(vec![input(&s, vec![col_f])], &[], &[agg(AggFunc::Sum, Some(f), DataType::Float64)], out_schema(&[("s", DataType::Float64)])).unwrap();
+        let out = run(
+            vec![input(&s, vec![col_f])],
+            &[],
+            &[agg(AggFunc::Sum, Some(f), DataType::Float64)],
+            out_schema(&[("s", DataType::Float64)]),
+        )
+        .unwrap();
         assert_eq!(rows(&out), vec![vec![ScalarValue::Float64(3.75)]]);
     }
 
@@ -397,18 +488,50 @@ mod tests {
         let a = col(&sch(&[("a", DataType::Int64)]), "a").unwrap();
         let mk = |f| agg(f, Some(a.clone()), DataType::Int64);
         let aggs = [mk(AggFunc::Min), mk(AggFunc::Max)];
-        let out = run(one_int_col(Some(vec![None, Some(7), Some(-2), Some(4), None])), &[], &aggs, out_schema(&[("mn", DataType::Int64), ("mx", DataType::Int64)])).unwrap();
-        assert_eq!(rows(&out), vec![vec![ScalarValue::Int64(-2), ScalarValue::Int64(7)]]);
+        let out = run(
+            one_int_col(Some(vec![None, Some(7), Some(-2), Some(4), None])),
+            &[],
+            &aggs,
+            out_schema(&[("mn", DataType::Int64), ("mx", DataType::Int64)]),
+        )
+        .unwrap();
+        assert_eq!(
+            rows(&out),
+            vec![vec![ScalarValue::Int64(-2), ScalarValue::Int64(7)]]
+        );
     }
 
     #[test]
     fn min_max_utf8_strings() {
         let s = sch(&[("t", DataType::Utf8)]);
         let t = col(&s, "t").unwrap();
-        let batch = input(&s, vec![Column::from_strs(&["pear", "apple", "a string longer than twelve bytes", "zebra"])]);
-        let aggs = [agg(AggFunc::Min, Some(t.clone()), DataType::Utf8), agg(AggFunc::Max, Some(t), DataType::Utf8)];
-        let out = run(vec![batch], &[], &aggs, out_schema(&[("mn", DataType::Utf8), ("mx", DataType::Utf8)])).unwrap();
-        assert_eq!(rows(&out), vec![vec![ScalarValue::Utf8("a string longer than twelve bytes".into()), ScalarValue::Utf8("zebra".into())]]);
+        let batch = input(
+            &s,
+            vec![Column::from_strs(&[
+                "pear",
+                "apple",
+                "a string longer than twelve bytes",
+                "zebra",
+            ])],
+        );
+        let aggs = [
+            agg(AggFunc::Min, Some(t.clone()), DataType::Utf8),
+            agg(AggFunc::Max, Some(t), DataType::Utf8),
+        ];
+        let out = run(
+            vec![batch],
+            &[],
+            &aggs,
+            out_schema(&[("mn", DataType::Utf8), ("mx", DataType::Utf8)]),
+        )
+        .unwrap();
+        assert_eq!(
+            rows(&out),
+            vec![vec![
+                ScalarValue::Utf8("a string longer than twelve bytes".into()),
+                ScalarValue::Utf8("zebra".into())
+            ]]
+        );
     }
 
     #[test]
@@ -416,15 +539,36 @@ mod tests {
         let s = sch(&[("b", DataType::Boolean)]);
         let b = col(&s, "b").unwrap();
         let batch = input(&s, vec![Column::from_bool(vec![true, true, false])]);
-        let aggs = [agg(AggFunc::Min, Some(b.clone()), DataType::Boolean), agg(AggFunc::Max, Some(b), DataType::Boolean)];
-        let out = run(vec![batch], &[], &aggs, out_schema(&[("mn", DataType::Boolean), ("mx", DataType::Boolean)])).unwrap();
-        assert_eq!(rows(&out), vec![vec![ScalarValue::Boolean(false), ScalarValue::Boolean(true)]]);
+        let aggs = [
+            agg(AggFunc::Min, Some(b.clone()), DataType::Boolean),
+            agg(AggFunc::Max, Some(b), DataType::Boolean),
+        ];
+        let out = run(
+            vec![batch],
+            &[],
+            &aggs,
+            out_schema(&[("mn", DataType::Boolean), ("mx", DataType::Boolean)]),
+        )
+        .unwrap();
+        assert_eq!(
+            rows(&out),
+            vec![vec![
+                ScalarValue::Boolean(false),
+                ScalarValue::Boolean(true)
+            ]]
+        );
     }
 
     #[test]
     fn avg_ignores_nulls() {
         let a = col(&sch(&[("a", DataType::Int64)]), "a").unwrap();
-        let out = run(one_int_col(Some(vec![Some(1), None, Some(4)])), &[], &[agg(AggFunc::Avg, Some(a), DataType::Float64)], out_schema(&[("av", DataType::Float64)])).unwrap();
+        let out = run(
+            one_int_col(Some(vec![Some(1), None, Some(4)])),
+            &[],
+            &[agg(AggFunc::Avg, Some(a), DataType::Float64)],
+            out_schema(&[("av", DataType::Float64)]),
+        )
+        .unwrap();
         assert_eq!(rows(&out), vec![vec![ScalarValue::Float64(2.5)]]);
     }
 
@@ -438,12 +582,24 @@ mod tests {
             agg(AggFunc::Max, Some(a.clone()), DataType::Int64),
             agg(AggFunc::Avg, Some(a), DataType::Float64),
         ];
-        let schema = out_schema(&[("c", DataType::Int64), ("s", DataType::Int64), ("mn", DataType::Int64), ("mx", DataType::Int64), ("av", DataType::Float64)]);
+        let schema = out_schema(&[
+            ("c", DataType::Int64),
+            ("s", DataType::Int64),
+            ("mn", DataType::Int64),
+            ("mx", DataType::Int64),
+            ("av", DataType::Float64),
+        ]);
         let out = run(vec![], &[], &aggs, schema).unwrap();
         let n = ScalarValue::Null(DataType::Int64);
         assert_eq!(
             rows(&out),
-            vec![vec![ScalarValue::Int64(0), n.clone(), n.clone(), n, ScalarValue::Null(DataType::Float64)]]
+            vec![vec![
+                ScalarValue::Int64(0),
+                n.clone(),
+                n.clone(),
+                n,
+                ScalarValue::Null(DataType::Float64)
+            ]]
         );
     }
 
@@ -451,7 +607,13 @@ mod tests {
     fn empty_input_with_group_gives_no_rows() {
         let s = sch(&[("g", DataType::Int64)]);
         let g = col(&s, "g").unwrap();
-        let out = run(vec![], &[g], &[agg(AggFunc::Count, None, DataType::Int64)], out_schema(&[("g", DataType::Int64), ("c", DataType::Int64)])).unwrap();
+        let out = run(
+            vec![],
+            &[g],
+            &[agg(AggFunc::Count, None, DataType::Int64)],
+            out_schema(&[("g", DataType::Int64), ("c", DataType::Int64)]),
+        )
+        .unwrap();
         assert_eq!(rows(&out), Vec::<Vec<ScalarValue>>::new());
     }
 
@@ -460,11 +622,34 @@ mod tests {
         let s = sch(&[("g", DataType::Int64), ("v", DataType::Int64)]);
         let g = col(&s, "g").unwrap();
         let v = col(&s, "v").unwrap();
-        let batch = input(&s, vec![ints(&[3, 1, 3, 2, 1]), ints(&[10, 20, 30, 40, 50])]);
-        let aggs = [agg(AggFunc::Sum, Some(v), DataType::Int64), agg(AggFunc::Count, None, DataType::Int64)];
-        let out = run(vec![batch], &[g], &aggs, out_schema(&[("g", DataType::Int64), ("s", DataType::Int64), ("c", DataType::Int64)])).unwrap();
+        let batch = input(
+            &s,
+            vec![ints(&[3, 1, 3, 2, 1]), ints(&[10, 20, 30, 40, 50])],
+        );
+        let aggs = [
+            agg(AggFunc::Sum, Some(v), DataType::Int64),
+            agg(AggFunc::Count, None, DataType::Int64),
+        ];
+        let out = run(
+            vec![batch],
+            &[g],
+            &aggs,
+            out_schema(&[
+                ("g", DataType::Int64),
+                ("s", DataType::Int64),
+                ("c", DataType::Int64),
+            ]),
+        )
+        .unwrap();
         let i = |x: i64| ScalarValue::Int64(x);
-        assert_eq!(rows(&out), vec![vec![i(3), i(40), i(2)], vec![i(1), i(70), i(2)], vec![i(2), i(40), i(1)]]);
+        assert_eq!(
+            rows(&out),
+            vec![
+                vec![i(3), i(40), i(2)],
+                vec![i(1), i(70), i(2)],
+                vec![i(2), i(40), i(1)]
+            ]
+        );
     }
 
     #[test]
@@ -474,10 +659,19 @@ mod tests {
         let v = col(&s, "v").unwrap();
         let gcol = ints_nullable(&[None, Some(1), None, Some(1)]);
         let batch = input(&s, vec![gcol, ints(&[1, 2, 3, 4])]);
-        let out = run(vec![batch], &[g], &[agg(AggFunc::Sum, Some(v), DataType::Int64)], out_schema(&[("g", DataType::Int64), ("s", DataType::Int64)])).unwrap();
+        let out = run(
+            vec![batch],
+            &[g],
+            &[agg(AggFunc::Sum, Some(v), DataType::Int64)],
+            out_schema(&[("g", DataType::Int64), ("s", DataType::Int64)]),
+        )
+        .unwrap();
         assert_eq!(
             rows(&out),
-            vec![vec![ScalarValue::Null(DataType::Int64), ScalarValue::Int64(4)], vec![ScalarValue::Int64(1), ScalarValue::Int64(6)]]
+            vec![
+                vec![ScalarValue::Null(DataType::Int64), ScalarValue::Int64(4)],
+                vec![ScalarValue::Int64(1), ScalarValue::Int64(6)]
+            ]
         );
     }
 
@@ -488,24 +682,70 @@ mod tests {
         let v = col(&s, "v").unwrap();
         let long_a = "this key is definitely longer than twelve bytes";
         let long_b = "this key is definitely longer than twelve bytez";
-        let batch = input(&s, vec![Column::from_strs(&[long_a, "short", long_b, long_a, "short"]), ints(&[1, 2, 4, 8, 16])]);
-        let out = run(vec![batch], &[k], &[agg(AggFunc::Sum, Some(v), DataType::Int64)], out_schema(&[("k", DataType::Utf8), ("s", DataType::Int64)])).unwrap();
+        let batch = input(
+            &s,
+            vec![
+                Column::from_strs(&[long_a, "short", long_b, long_a, "short"]),
+                ints(&[1, 2, 4, 8, 16]),
+            ],
+        );
+        let out = run(
+            vec![batch],
+            &[k],
+            &[agg(AggFunc::Sum, Some(v), DataType::Int64)],
+            out_schema(&[("k", DataType::Utf8), ("s", DataType::Int64)]),
+        )
+        .unwrap();
         let s_ = |x: &str| ScalarValue::Utf8(x.into());
         let i = ScalarValue::Int64;
-        assert_eq!(rows(&out), vec![vec![s_(long_a), i(9)], vec![s_("short"), i(18)], vec![s_(long_b), i(4)]]);
+        assert_eq!(
+            rows(&out),
+            vec![
+                vec![s_(long_a), i(9)],
+                vec![s_("short"), i(18)],
+                vec![s_(long_b), i(4)]
+            ]
+        );
     }
 
     #[test]
     fn two_key_group_with_null_and_multiple_batches() {
-        let s = sch(&[("a", DataType::Int64), ("b", DataType::Utf8), ("v", DataType::Int64)]);
+        let s = sch(&[
+            ("a", DataType::Int64),
+            ("b", DataType::Utf8),
+            ("v", DataType::Int64),
+        ]);
         let a = col(&s, "a").unwrap();
         let b = col(&s, "b").unwrap();
         let v = col(&s, "v").unwrap();
-        let b1 = input(&s, vec![ints(&[1, 1]), Column::from_strs(&["x", "y"]), ints(&[1, 2])]);
-        let b2 = input(&s, vec![ints_nullable(&[Some(1), None]), Column::from_strs(&["x", "x"]), ints(&[10, 20])]);
-        let b3 = input(&s, vec![ints(&[1]), Column::from_strs(&["x"]), ints(&[100])]);
+        let b1 = input(
+            &s,
+            vec![ints(&[1, 1]), Column::from_strs(&["x", "y"]), ints(&[1, 2])],
+        );
+        let b2 = input(
+            &s,
+            vec![
+                ints_nullable(&[Some(1), None]),
+                Column::from_strs(&["x", "x"]),
+                ints(&[10, 20]),
+            ],
+        );
+        let b3 = input(
+            &s,
+            vec![ints(&[1]), Column::from_strs(&["x"]), ints(&[100])],
+        );
         let aggs = [agg(AggFunc::Sum, Some(v), DataType::Int64)];
-        let out = run(vec![b1, b2, b3], &[a, b], &aggs, out_schema(&[("a", DataType::Int64), ("b", DataType::Utf8), ("s", DataType::Int64)])).unwrap();
+        let out = run(
+            vec![b1, b2, b3],
+            &[a, b],
+            &aggs,
+            out_schema(&[
+                ("a", DataType::Int64),
+                ("b", DataType::Utf8),
+                ("s", DataType::Int64),
+            ]),
+        )
+        .unwrap();
         let i = ScalarValue::Int64;
         let n = ScalarValue::Null(DataType::Int64);
         let u = |x: &str| ScalarValue::Utf8(x.into());
@@ -525,7 +765,13 @@ mod tests {
         let a = col(&s, "a").unwrap();
         let parity = binary(a, BinaryOp::Mod, lit(ScalarValue::Int64(2))).unwrap();
         let batch = input(&s, vec![ints(&[1, 2, 3, 4, 5]), ints(&[1, 1, 1, 1, 1])]);
-        let out = run(vec![batch], &[parity], &[agg(AggFunc::Count, None, DataType::Int64)], out_schema(&[("p", DataType::Int64), ("c", DataType::Int64)])).unwrap();
+        let out = run(
+            vec![batch],
+            &[parity],
+            &[agg(AggFunc::Count, None, DataType::Int64)],
+            out_schema(&[("p", DataType::Int64), ("c", DataType::Int64)]),
+        )
+        .unwrap();
         let i = ScalarValue::Int64;
         assert_eq!(rows(&out), vec![vec![i(1), i(3)], vec![i(0), i(2)]]);
     }
@@ -536,7 +782,20 @@ mod tests {
         let g = col(&s, "g").unwrap();
         let v = col(&s, "v").unwrap();
         let batch = input(&s, vec![ints(&[1, 1]), ints_nullable(&[None, None])]);
-        let out = run(vec![batch], &[g], &[agg(AggFunc::Sum, Some(v.clone()), DataType::Int64), agg(AggFunc::Max, Some(v), DataType::Int64)], out_schema(&[("g", DataType::Int64), ("s", DataType::Int64), ("m", DataType::Int64)])).unwrap();
+        let out = run(
+            vec![batch],
+            &[g],
+            &[
+                agg(AggFunc::Sum, Some(v.clone()), DataType::Int64),
+                agg(AggFunc::Max, Some(v), DataType::Int64),
+            ],
+            out_schema(&[
+                ("g", DataType::Int64),
+                ("s", DataType::Int64),
+                ("m", DataType::Int64),
+            ]),
+        )
+        .unwrap();
         let n = ScalarValue::Null(DataType::Int64);
         assert_eq!(rows(&out), vec![vec![ScalarValue::Int64(1), n.clone(), n]]);
     }
@@ -544,25 +803,48 @@ mod tests {
     fn min_max_f64(vals: Column) -> Vec<ScalarValue> {
         let s = sch(&[("f", DataType::Float64)]);
         let f = col(&s, "f").unwrap();
-        let aggs = [agg(AggFunc::Min, Some(f.clone()), DataType::Float64), agg(AggFunc::Max, Some(f), DataType::Float64)];
-        let out = run(vec![input(&s, vec![vals])], &[], &aggs, out_schema(&[("mn", DataType::Float64), ("mx", DataType::Float64)])).unwrap();
+        let aggs = [
+            agg(AggFunc::Min, Some(f.clone()), DataType::Float64),
+            agg(AggFunc::Max, Some(f), DataType::Float64),
+        ];
+        let out = run(
+            vec![input(&s, vec![vals])],
+            &[],
+            &aggs,
+            out_schema(&[("mn", DataType::Float64), ("mx", DataType::Float64)]),
+        )
+        .unwrap();
         rows(&out).remove(0)
     }
 
     #[test]
     fn min_max_float_ignores_nan_in_every_position() {
         let nan = f64::NAN;
-        let perms = [[nan, 1.0, 2.0], [nan, 2.0, 1.0], [1.0, nan, 2.0], [2.0, nan, 1.0], [1.0, 2.0, nan], [2.0, 1.0, nan]];
+        let perms = [
+            [nan, 1.0, 2.0],
+            [nan, 2.0, 1.0],
+            [1.0, nan, 2.0],
+            [2.0, nan, 1.0],
+            [1.0, 2.0, nan],
+            [2.0, 1.0, nan],
+        ];
         for p in perms {
             let got = min_max_f64(Column::from_f64(p.to_vec()));
-            assert_eq!(got, vec![ScalarValue::Float64(1.0), ScalarValue::Float64(2.0)], "input {p:?}");
+            assert_eq!(
+                got,
+                vec![ScalarValue::Float64(1.0), ScalarValue::Float64(2.0)],
+                "input {p:?}"
+            );
         }
     }
 
     #[test]
     fn min_max_float_all_nan_is_nan() {
         let nan = f64::NAN;
-        for vals in [Column::from_f64(vec![nan, nan]), Column::from_f64(vec![nan, 5.0]).with_validity(vec![true, false])] {
+        for vals in [
+            Column::from_f64(vec![nan, nan]),
+            Column::from_f64(vec![nan, 5.0]).with_validity(vec![true, false]),
+        ] {
             for v in min_max_f64(vals) {
                 match v {
                     ScalarValue::Float64(x) => assert!(x.is_nan(), "expected NaN, got {x}"),
@@ -575,9 +857,18 @@ mod tests {
     #[test]
     fn sum_int_declared_as_float_is_type_error() {
         let a = col(&sch(&[("a", DataType::Int64)]), "a").unwrap();
-        let err = run(one_int_col(Some(vec![Some(1), Some(2)])), &[], &[agg(AggFunc::Sum, Some(a), DataType::Float64)], out_schema(&[("s", DataType::Float64)])).unwrap_err();
+        let err = run(
+            one_int_col(Some(vec![Some(1), Some(2)])),
+            &[],
+            &[agg(AggFunc::Sum, Some(a), DataType::Float64)],
+            out_schema(&[("s", DataType::Float64)]),
+        )
+        .unwrap_err();
         match err {
-            EngineError::Type(msg) => assert!(msg.contains("Sum") && msg.contains("Int64") && msg.contains("Float64"), "{msg}"),
+            EngineError::Type(msg) => assert!(
+                msg.contains("Sum") && msg.contains("Int64") && msg.contains("Float64"),
+                "{msg}"
+            ),
             other => panic!("expected type error, got {other:?}"),
         }
     }
@@ -588,14 +879,28 @@ mod tests {
         let g = col(&s, "g").unwrap();
         let batch = input(&s, vec![ints(&(0..1000).collect::<Vec<i64>>())]);
         let budget = MemoryBudget::new(1024);
-        let err = hash_aggregate(vec![batch], &[g], &[agg(AggFunc::Count, None, DataType::Int64)], out_schema(&[("g", DataType::Int64), ("c", DataType::Int64)]), &budget, &dir()).unwrap_err();
+        let err = hash_aggregate(
+            vec![batch],
+            &[g],
+            &[agg(AggFunc::Count, None, DataType::Int64)],
+            out_schema(&[("g", DataType::Int64), ("c", DataType::Int64)]),
+            &budget,
+            &dir(),
+        )
+        .unwrap_err();
         assert!(matches!(err, EngineError::Memory { .. }), "got {err:?}");
         assert_eq!(budget.used(), 0, "reservation released after failure");
     }
 
     #[test]
     fn schema_arity_mismatch_is_plan_error() {
-        let err = run(vec![], &[], &[agg(AggFunc::Count, None, DataType::Int64)], out_schema(&[("a", DataType::Int64), ("b", DataType::Int64)])).unwrap_err();
+        let err = run(
+            vec![],
+            &[],
+            &[agg(AggFunc::Count, None, DataType::Int64)],
+            out_schema(&[("a", DataType::Int64), ("b", DataType::Int64)]),
+        )
+        .unwrap_err();
         assert!(matches!(err, EngineError::Plan(_)));
     }
 
@@ -604,7 +909,13 @@ mod tests {
         let s = sch(&[("t", DataType::Utf8)]);
         let t = col(&s, "t").unwrap();
         let batch = input(&s, vec![Column::from_strs(&["a"])]);
-        let err = run(vec![batch], &[], &[agg(AggFunc::Sum, Some(t), DataType::Utf8)], out_schema(&[("s", DataType::Utf8)])).unwrap_err();
+        let err = run(
+            vec![batch],
+            &[],
+            &[agg(AggFunc::Sum, Some(t), DataType::Utf8)],
+            out_schema(&[("s", DataType::Utf8)]),
+        )
+        .unwrap_err();
         assert!(matches!(err, EngineError::Type(_)));
     }
 
@@ -616,7 +927,20 @@ mod tests {
         let gs: Vec<i64> = (0..5000).map(|i| (i * 7919) % 613).collect();
         let vs: Vec<i64> = (0..5000).collect();
         let batch = input(&s, vec![ints(&gs), ints(&vs)]);
-        let out = run(vec![batch], &[g], &[agg(AggFunc::Sum, Some(v), DataType::Int64), agg(AggFunc::Count, None, DataType::Int64)], out_schema(&[("g", DataType::Int64), ("s", DataType::Int64), ("c", DataType::Int64)])).unwrap();
+        let out = run(
+            vec![batch],
+            &[g],
+            &[
+                agg(AggFunc::Sum, Some(v), DataType::Int64),
+                agg(AggFunc::Count, None, DataType::Int64),
+            ],
+            out_schema(&[
+                ("g", DataType::Int64),
+                ("s", DataType::Int64),
+                ("c", DataType::Int64),
+            ]),
+        )
+        .unwrap();
         let got = rows(&out);
         assert_eq!(got.len(), 613);
         let mut naive: HashMap<i64, (i64, i64)> = HashMap::new();
@@ -626,7 +950,9 @@ mod tests {
             e.1 += 1;
         }
         for r in got {
-            let ScalarValue::Int64(k) = r[0] else { panic!() };
+            let ScalarValue::Int64(k) = r[0] else {
+                panic!()
+            };
             assert_eq!(r[1], ScalarValue::Int64(naive[&k].0));
             assert_eq!(r[2], ScalarValue::Int64(naive[&k].1));
         }

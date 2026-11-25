@@ -14,7 +14,11 @@ use crate::types::{DataType, EngineError, Result, ScalarValue, Schema};
 /// Build `Expr::Column` by name (resolves index + type from `schema`).
 pub fn col(schema: &Schema, name: &str) -> Result<Expr> {
     let index = schema.index_of(name)?;
-    Ok(Expr::Column { name: name.to_string(), index, data_type: schema.fields[index].data_type })
+    Ok(Expr::Column {
+        name: name.to_string(),
+        index,
+        data_type: schema.fields[index].data_type,
+    })
 }
 
 pub fn lit(v: ScalarValue) -> Expr {
@@ -24,12 +28,21 @@ pub fn lit(v: ScalarValue) -> Expr {
 /// Type-checked constructor: infers `return_type` or returns EngineError::Type.
 pub fn binary(l: Expr, op: BinaryOp, r: Expr) -> Result<Expr> {
     let return_type = binary_type(l.return_type(), op, r.return_type())?;
-    Ok(Expr::Binary { left: Box::new(l), op, right: Box::new(r), return_type })
+    Ok(Expr::Binary {
+        left: Box::new(l),
+        op,
+        right: Box::new(r),
+        return_type,
+    })
 }
 
 pub fn unary(op: UnaryOp, e: Expr) -> Result<Expr> {
     let return_type = unary_type(op, e.return_type())?;
-    Ok(Expr::Unary { op, expr: Box::new(e), return_type })
+    Ok(Expr::Unary {
+        op,
+        expr: Box::new(e),
+        return_type,
+    })
 }
 
 pub fn cast(e: Expr, to: DataType) -> Result<Expr> {
@@ -37,16 +50,26 @@ pub fn cast(e: Expr, to: DataType) -> Result<Expr> {
     if !cast_supported(from, to) {
         return Err(type_err(format!("cannot cast {from:?} to {to:?}")));
     }
-    Ok(Expr::Cast { expr: Box::new(e), target_type: to })
+    Ok(Expr::Cast {
+        expr: Box::new(e),
+        target_type: to,
+    })
 }
 
 /// `CASE WHEN c THEN t ELSE e END`. Numeric branches promote to Float64.
 pub fn case(c: Expr, t: Expr, e: Expr) -> Result<Expr> {
     if c.return_type() != DataType::Boolean {
-        return Err(type_err(format!("CASE condition must be Boolean, got {:?}", c.return_type())));
+        return Err(type_err(format!(
+            "CASE condition must be Boolean, got {:?}",
+            c.return_type()
+        )));
     }
     let return_type = common_type(t.return_type(), e.return_type()).ok_or_else(|| {
-        type_err(format!("CASE branches {:?} and {:?} do not unify", t.return_type(), e.return_type()))
+        type_err(format!(
+            "CASE branches {:?} and {:?} do not unify",
+            t.return_type(),
+            e.return_type()
+        ))
     })?;
     Ok(Expr::Case {
         condition: Box::new(c),
@@ -60,25 +83,51 @@ pub fn case(c: Expr, t: Expr, e: Expr) -> Result<Expr> {
 pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
     let n = batch.num_rows;
     match expr {
-        Expr::Column { name, index, data_type } => {
-            let c = batch.columns.get(*index).ok_or_else(|| EngineError::ColumnNotFound(name.clone()))?;
+        Expr::Column {
+            name,
+            index,
+            data_type,
+        } => {
+            let c = batch
+                .columns
+                .get(*index)
+                .ok_or_else(|| EngineError::ColumnNotFound(name.clone()))?;
             if c.data_type() != *data_type {
-                return Err(type_err(format!("column '{name}' is {:?}, expected {data_type:?}", c.data_type())));
+                return Err(type_err(format!(
+                    "column '{name}' is {:?}, expected {data_type:?}",
+                    c.data_type()
+                )));
             }
             Ok(c.clone())
         }
         Expr::Literal(v) => Ok(broadcast(v, n)),
-        Expr::Binary { left, op, right, return_type } => {
+        Expr::Binary {
+            left,
+            op,
+            right,
+            return_type,
+        } => {
             let l = eval(left, batch)?;
             let r = eval(right, batch)?;
             expect_type(binary_cols(&l, *op, &r)?, *return_type)
         }
-        Expr::Unary { op, expr: inner, return_type } => {
+        Expr::Unary {
+            op,
+            expr: inner,
+            return_type,
+        } => {
             let c = eval(inner, batch)?;
             expect_type(unary_col(*op, &c)?, *return_type)
         }
-        Expr::Cast { expr: inner, target_type } => cast_col(&eval(inner, batch)?, *target_type),
-        Expr::InList { expr: inner, list, negated } => {
+        Expr::Cast {
+            expr: inner,
+            target_type,
+        } => cast_col(&eval(inner, batch)?, *target_type),
+        Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => {
             let x = eval(inner, batch)?;
             // x IN (a, b) == (x = a) OR (x = b), with the same 3VL as the OR operator.
             let mut acc = Column::from_bool(vec![false; n]);
@@ -92,7 +141,12 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
             }
             Ok(acc)
         }
-        Expr::Case { condition, then_expr, else_expr, return_type } => {
+        Expr::Case {
+            condition,
+            then_expr,
+            else_expr,
+            return_type,
+        } => {
             let c = eval(condition, batch)?;
             let cb = as_bools(&c)?;
             // Each branch runs only on the rows that select it, so a branch error on another row is never raised.
@@ -130,29 +184,55 @@ pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
 pub fn eval_predicate(expr: &Expr, batch: &Batch) -> Result<Vec<bool>> {
     let c = eval(expr, batch)?;
     let b = as_bools(&c)?;
-    Ok(b.iter().enumerate().map(|(i, &v)| v && c.is_valid(i)).collect())
+    Ok(b.iter()
+        .enumerate()
+        .map(|(i, &v)| v && c.is_valid(i))
+        .collect())
 }
 
 /// Constant folding / algebraic simplification (x+0, x*1, true AND x, literal-only subtrees).
 /// Never changes results: a literal-only subtree that errors is left as written, so the error still surfaces.
 pub fn optimize(expr: Expr) -> Expr {
     let rebuilt = match expr {
-        Expr::Binary { left, op, right, return_type } => Expr::Binary {
+        Expr::Binary {
+            left,
+            op,
+            right,
+            return_type,
+        } => Expr::Binary {
             left: Box::new(optimize(*left)),
             op,
             right: Box::new(optimize(*right)),
             return_type,
         },
-        Expr::Unary { op, expr, return_type } => {
-            Expr::Unary { op, expr: Box::new(optimize(*expr)), return_type }
-        }
-        Expr::Cast { expr, target_type } => Expr::Cast { expr: Box::new(optimize(*expr)), target_type },
-        Expr::InList { expr, list, negated } => Expr::InList {
+        Expr::Unary {
+            op,
+            expr,
+            return_type,
+        } => Expr::Unary {
+            op,
+            expr: Box::new(optimize(*expr)),
+            return_type,
+        },
+        Expr::Cast { expr, target_type } => Expr::Cast {
+            expr: Box::new(optimize(*expr)),
+            target_type,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
             expr: Box::new(optimize(*expr)),
             list: list.into_iter().map(optimize).collect(),
             negated,
         },
-        Expr::Case { condition, then_expr, else_expr, return_type } => Expr::Case {
+        Expr::Case {
+            condition,
+            then_expr,
+            else_expr,
+            return_type,
+        } => Expr::Case {
             condition: Box::new(optimize(*condition)),
             then_expr: Box::new(optimize(*then_expr)),
             else_expr: Box::new(optimize(*else_expr)),
@@ -172,7 +252,9 @@ fn type_err(msg: impl Into<String>) -> EngineError {
 fn common_type(a: DataType, b: DataType) -> Option<DataType> {
     match (a, b) {
         _ if a == b => Some(a),
-        (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64) => Some(DataType::Float64),
+        (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64) => {
+            Some(DataType::Float64)
+        }
         _ => None,
     }
 }
@@ -185,16 +267,21 @@ fn binary_type(l: DataType, op: BinaryOp, r: DataType) -> Result<DataType> {
                 _ => Err(type_err(format!("arithmetic {op:?} on {l:?} and {r:?}"))),
             }
         }
-        BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
-            common_type(l, r)
-                .map(|_| DataType::Boolean)
-                .ok_or_else(|| type_err(format!("cannot compare {l:?} with {r:?}")))
-        }
+        BinaryOp::Eq
+        | BinaryOp::NotEq
+        | BinaryOp::Lt
+        | BinaryOp::LtEq
+        | BinaryOp::Gt
+        | BinaryOp::GtEq => common_type(l, r)
+            .map(|_| DataType::Boolean)
+            .ok_or_else(|| type_err(format!("cannot compare {l:?} with {r:?}"))),
         BinaryOp::And | BinaryOp::Or => {
             if l == DataType::Boolean && r == DataType::Boolean {
                 Ok(DataType::Boolean)
             } else {
-                Err(type_err(format!("{op:?} needs Boolean operands, got {l:?} and {r:?}")))
+                Err(type_err(format!(
+                    "{op:?} needs Boolean operands, got {l:?} and {r:?}"
+                )))
             }
         }
     }
@@ -211,16 +298,23 @@ fn unary_type(op: UnaryOp, dt: DataType) -> Result<DataType> {
 
 fn cast_supported(from: DataType, to: DataType) -> bool {
     from == to
-        || matches!((from, to), (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64))
+        || matches!(
+            (from, to),
+            (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
+        )
         || to == DataType::Utf8
-        || (from == DataType::Utf8 && matches!(to, DataType::Int64 | DataType::Float64 | DataType::Boolean))
+        || (from == DataType::Utf8
+            && matches!(to, DataType::Int64 | DataType::Float64 | DataType::Boolean))
 }
 
 fn coerce(e: Expr, to: DataType) -> Expr {
     if e.return_type() == to {
         e
     } else {
-        Expr::Cast { expr: Box::new(e), target_type: to }
+        Expr::Cast {
+            expr: Box::new(e),
+            target_type: to,
+        }
     }
 }
 
@@ -230,7 +324,10 @@ fn expect_type(c: Column, dt: DataType) -> Result<Column> {
     if c.data_type() == dt {
         Ok(c)
     } else {
-        Err(type_err(format!("expression produced {:?}, declared {dt:?}", c.data_type())))
+        Err(type_err(format!(
+            "expression produced {:?}, declared {dt:?}",
+            c.data_type()
+        )))
     }
 }
 
@@ -288,7 +385,10 @@ fn valid_at(v: Option<&[bool]>, i: usize) -> bool {
 fn as_bools(c: &Column) -> Result<&[bool]> {
     match &c.values {
         Values::Bool(v) => Ok(v),
-        _ => Err(type_err(format!("expected Boolean, got {:?}", c.data_type()))),
+        _ => Err(type_err(format!(
+            "expected Boolean, got {:?}",
+            c.data_type()
+        ))),
     }
 }
 
@@ -305,7 +405,10 @@ fn as_f64(c: &Column) -> Result<Cow<'_, [f64]>> {
         Values::Float64(v) => Ok(Cow::Borrowed(v.as_slice())),
         // shortcut: widening copies the column; a typed kernel per operand pair would avoid it.
         Values::Int64(v) => Ok(Cow::Owned(v.iter().map(|&x| x as f64).collect())),
-        _ => Err(type_err(format!("expected a numeric column, got {:?}", c.data_type()))),
+        _ => Err(type_err(format!(
+            "expected a numeric column, got {:?}",
+            c.data_type()
+        ))),
     }
 }
 
@@ -324,9 +427,12 @@ fn binary_cols(l: &Column, op: BinaryOp, r: &Column) -> Result<Column> {
     let rt = binary_type(l.data_type(), op, r.data_type())?;
     match op {
         BinaryOp::And | BinaryOp::Or => logic(op, l, r),
-        BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
-            compare(l, op, r)
-        }
+        BinaryOp::Eq
+        | BinaryOp::NotEq
+        | BinaryOp::Lt
+        | BinaryOp::LtEq
+        | BinaryOp::Gt
+        | BinaryOp::GtEq => compare(l, op, r),
         _ => arith(l, op, r, rt),
     }
 }
@@ -334,7 +440,9 @@ fn binary_cols(l: &Column, op: BinaryOp, r: &Column) -> Result<Column> {
 fn arith(l: &Column, op: BinaryOp, r: &Column, dt: DataType) -> Result<Column> {
     let validity = merge_validity(l.validity.as_deref(), r.validity.as_deref());
     let values = match dt {
-        DataType::Int64 => Values::Int64(int_arith(op, as_i64(l)?, as_i64(r)?, validity.as_deref())?),
+        DataType::Int64 => {
+            Values::Int64(int_arith(op, as_i64(l)?, as_i64(r)?, validity.as_deref())?)
+        }
         DataType::Float64 => Values::Float64(float_arith(op, &as_f64(l)?, &as_f64(r)?)?),
         _ => return Err(type_err(format!("arithmetic result type {dt:?}"))),
     };
@@ -351,7 +459,11 @@ fn int_arith(op: BinaryOp, a: &[i64], b: &[i64], validity: Option<&[bool]>) -> R
             for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
                 if y == 0 {
                     if valid_at(validity, i) {
-                        let what = if op == BinaryOp::Div { "integer division" } else { "integer remainder" };
+                        let what = if op == BinaryOp::Div {
+                            "integer division"
+                        } else {
+                            "integer remainder"
+                        };
                         return Err(EngineError::Arithmetic(format!("{what} by zero")));
                     }
                     // NULL divisor: the slot is NULL, so its value is a placeholder.
@@ -380,8 +492,13 @@ fn float_arith(op: BinaryOp, a: &[f64], b: &[f64]) -> Result<Vec<f64>> {
 }
 
 fn compare(l: &Column, op: BinaryOp, r: &Column) -> Result<Column> {
-    let dt = common_type(l.data_type(), r.data_type())
-        .ok_or_else(|| type_err(format!("cannot compare {:?} with {:?}", l.data_type(), r.data_type())))?;
+    let dt = common_type(l.data_type(), r.data_type()).ok_or_else(|| {
+        type_err(format!(
+            "cannot compare {:?} with {:?}",
+            l.data_type(),
+            r.data_type()
+        ))
+    })?;
     let values = match dt {
         DataType::Boolean => cmp_slices(op, as_bools(l)?, as_bools(r)?),
         DataType::Int64 => cmp_slices(op, as_i64(l)?, as_i64(r)?),
@@ -446,15 +563,28 @@ fn unary_col(op: UnaryOp, c: &Column) -> Result<Column> {
     match op {
         UnaryOp::Not => {
             let b = as_bools(c)?;
-            Ok(finish(Values::Bool(b.iter().map(|&x| !x).collect()), validity))
+            Ok(finish(
+                Values::Bool(b.iter().map(|&x| !x).collect()),
+                validity,
+            ))
         }
         UnaryOp::Neg => match &c.values {
-            Values::Int64(v) => Ok(finish(Values::Int64(v.iter().map(|&x| x.wrapping_neg()).collect()), validity)),
-            Values::Float64(v) => Ok(finish(Values::Float64(v.iter().map(|&x| -x).collect()), validity)),
+            Values::Int64(v) => Ok(finish(
+                Values::Int64(v.iter().map(|&x| x.wrapping_neg()).collect()),
+                validity,
+            )),
+            Values::Float64(v) => Ok(finish(
+                Values::Float64(v.iter().map(|&x| -x).collect()),
+                validity,
+            )),
             _ => Err(type_err(format!("Neg not defined for {:?}", c.data_type()))),
         },
-        UnaryOp::IsNull => Ok(Column::from_bool((0..c.len()).map(|i| !c.is_valid(i)).collect())),
-        UnaryOp::IsNotNull => Ok(Column::from_bool((0..c.len()).map(|i| c.is_valid(i)).collect())),
+        UnaryOp::IsNull => Ok(Column::from_bool(
+            (0..c.len()).map(|i| !c.is_valid(i)).collect(),
+        )),
+        UnaryOp::IsNotNull => Ok(Column::from_bool(
+            (0..c.len()).map(|i| c.is_valid(i)).collect(),
+        )),
     }
 }
 
@@ -468,7 +598,10 @@ fn scalar_text(c: &Column, i: usize) -> String {
 }
 
 /// Parses every valid Utf8 slot; a failed parse or a NULL input yields a NULL output slot.
-fn parse_slots<T: Default>(c: &Column, parse: impl Fn(&str) -> Option<T>) -> Result<(Vec<T>, Vec<bool>)> {
+fn parse_slots<T: Default>(
+    c: &Column,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<(Vec<T>, Vec<bool>)> {
     let strs = utf8_strs(c)?;
     let mut vals = Vec::with_capacity(strs.len());
     let mut ok = Vec::with_capacity(strs.len());
@@ -500,16 +633,28 @@ fn cast_col(c: &Column, to: DataType) -> Result<Column> {
         return Err(type_err(format!("cannot cast {from:?} to {to:?}")));
     }
     let (values, validity) = match (&c.values, to) {
-        (Values::Int64(v), DataType::Float64) => {
-            (Values::Float64(v.iter().map(|&x| x as f64).collect()), c.validity.clone())
-        }
-        (Values::Float64(v), DataType::Int64) => {
-            (Values::Int64(v.iter().map(|&x| x as i64).collect()), c.validity.clone())
-        }
+        (Values::Int64(v), DataType::Float64) => (
+            Values::Float64(v.iter().map(|&x| x as f64).collect()),
+            c.validity.clone(),
+        ),
+        (Values::Float64(v), DataType::Int64) => (
+            Values::Int64(v.iter().map(|&x| x as i64).collect()),
+            c.validity.clone(),
+        ),
         (_, DataType::Utf8) => {
-            let strs: Vec<String> =
-                (0..c.len()).map(|i| if c.is_valid(i) { scalar_text(c, i) } else { String::new() }).collect();
-            (Values::Utf8(StringViews::from_strs(&strs)), c.validity.clone())
+            let strs: Vec<String> = (0..c.len())
+                .map(|i| {
+                    if c.is_valid(i) {
+                        scalar_text(c, i)
+                    } else {
+                        String::new()
+                    }
+                })
+                .collect();
+            (
+                Values::Utf8(StringViews::from_strs(&strs)),
+                c.validity.clone(),
+            )
         }
         (Values::Utf8(_), DataType::Int64) => {
             let (v, ok) = parse_slots(c, |s| s.trim().parse::<i64>().ok())?;
@@ -537,9 +682,12 @@ fn is_constant(e: &Expr) -> bool {
         Expr::Binary { left, right, .. } => is_constant(left) && is_constant(right),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => is_constant(expr),
         Expr::InList { expr, list, .. } => is_constant(expr) && list.iter().all(is_constant),
-        Expr::Case { condition, then_expr, else_expr, .. } => {
-            is_constant(condition) && is_constant(then_expr) && is_constant(else_expr)
-        }
+        Expr::Case {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => is_constant(condition) && is_constant(then_expr) && is_constant(else_expr),
     }
 }
 
@@ -549,7 +697,11 @@ fn fold(expr: Expr) -> Expr {
     if matches!(expr, Expr::Literal(_)) || !is_constant(&expr) {
         return expr;
     }
-    let one_row = Batch { schema: schema_ref(Schema::default()), columns: vec![], num_rows: 1 };
+    let one_row = Batch {
+        schema: schema_ref(Schema::default()),
+        columns: vec![],
+        num_rows: 1,
+    };
     match eval(&expr, &one_row) {
         Ok(c) if c.len() == 1 => Expr::Literal(c.get(0)),
         _ => expr,
@@ -559,10 +711,20 @@ fn fold(expr: Expr) -> Expr {
 /// Algebraic identities that hold for every row including NULLs and NaN.
 fn simplify(expr: Expr) -> Expr {
     match expr {
-        Expr::Binary { left, op, right, return_type } => match identity_side(&left, op, &right, return_type) {
+        Expr::Binary {
+            left,
+            op,
+            right,
+            return_type,
+        } => match identity_side(&left, op, &right, return_type) {
             Some(true) => *left,
             Some(false) => *right,
-            None => Expr::Binary { left, op, right, return_type },
+            None => Expr::Binary {
+                left,
+                op,
+                right,
+                return_type,
+            },
         },
         other => other,
     }
@@ -580,8 +742,12 @@ fn identity_side(l: &Expr, op: BinaryOp, r: &Expr, rt: DataType) -> Option<bool>
         BinaryOp::Or if is(l, ScalarValue::Boolean(false)) && same(r) => Some(false),
         BinaryOp::Or if is(r, ScalarValue::Boolean(false)) && same(l) => Some(true),
         // Int64 only: for floats, -0.0 + 0.0 is 0.0, which would change the value.
-        BinaryOp::Add if rt == DataType::Int64 && is(r, ScalarValue::Int64(0)) && same(l) => Some(true),
-        BinaryOp::Add if rt == DataType::Int64 && is(l, ScalarValue::Int64(0)) && same(r) => Some(false),
+        BinaryOp::Add if rt == DataType::Int64 && is(r, ScalarValue::Int64(0)) && same(l) => {
+            Some(true)
+        }
+        BinaryOp::Add if rt == DataType::Int64 && is(l, ScalarValue::Int64(0)) && same(r) => {
+            Some(false)
+        }
         // x * 1 is exact for every IEEE value, so the 1 is dropped as long as no promotion happens.
         BinaryOp::Mul if is(r, ScalarValue::Int64(1)) || is(r, ScalarValue::Float64(1.0)) => {
             same(l).then_some(true)
@@ -602,7 +768,10 @@ mod tests {
 
     /// Builds a schema and batch whose fields are named after the given columns.
     fn setup(cols: Vec<(&str, Column)>) -> (Schema, Batch) {
-        let fields = cols.iter().map(|(n, c)| Field::new(n, c.data_type(), c.validity.is_some())).collect();
+        let fields = cols
+            .iter()
+            .map(|(n, c)| Field::new(n, c.data_type(), c.validity.is_some()))
+            .collect();
         let schema = Schema::new(fields);
         let columns = cols.into_iter().map(|(_, c)| c).collect();
         let batch = Batch::try_new(schema_ref(schema.clone()), columns).unwrap();
@@ -648,11 +817,17 @@ mod tests {
 
     #[test]
     fn col_resolves_index_and_type_and_rejects_unknown_names() {
-        let (schema, _) = setup(vec![("a", Column::from_i64(vec![1])), ("b", Column::from_strs(&["x"]))]);
+        let (schema, _) = setup(vec![
+            ("a", Column::from_i64(vec![1])),
+            ("b", Column::from_strs(&["x"])),
+        ]);
         let e = col(&schema, "b").unwrap();
         assert_eq!(e.return_type(), DataType::Utf8);
         assert!(matches!(e, Expr::Column { index: 1, .. }));
-        assert_eq!(col(&schema, "zz"), Err(EngineError::ColumnNotFound("zz".into())));
+        assert_eq!(
+            col(&schema, "zz"),
+            Err(EngineError::ColumnNotFound("zz".into()))
+        );
     }
 
     #[test]
@@ -669,7 +844,12 @@ mod tests {
             ("a", Column::from_i64(vec![1, 2])),
             ("b", Column::from_f64(vec![0.5, 1.0])),
         ]);
-        let e = binary(col(&schema, "a").unwrap(), BinaryOp::Add, col(&schema, "b").unwrap()).unwrap();
+        let e = binary(
+            col(&schema, "a").unwrap(),
+            BinaryOp::Add,
+            col(&schema, "b").unwrap(),
+        )
+        .unwrap();
         assert_eq!(e.return_type(), DataType::Float64);
         assert_eq!(run(&e, &b), vec![flt(1.5), flt(3.0)]);
     }
@@ -684,17 +864,26 @@ mod tests {
 
     #[test]
     fn arithmetic_on_utf8_is_type_error() {
-        assert!(matches!(binary(s("a"), BinaryOp::Add, i(1)), Err(EngineError::Type(_))));
+        assert!(matches!(
+            binary(s("a"), BinaryOp::Add, i(1)),
+            Err(EngineError::Type(_))
+        ));
     }
 
     #[test]
     fn and_on_int_is_type_error() {
-        assert!(matches!(binary(i(1), BinaryOp::And, bool_lit(true)), Err(EngineError::Type(_))));
+        assert!(matches!(
+            binary(i(1), BinaryOp::And, bool_lit(true)),
+            Err(EngineError::Type(_))
+        ));
     }
 
     #[test]
     fn comparing_int_with_utf8_is_type_error() {
-        assert!(matches!(binary(i(1), BinaryOp::Lt, s("1")), Err(EngineError::Type(_))));
+        assert!(matches!(
+            binary(i(1), BinaryOp::Lt, s("1")),
+            Err(EngineError::Type(_))
+        ));
     }
 
     #[test]
@@ -710,7 +899,12 @@ mod tests {
             ("a", Column::from_i64(vec![1, 2])),
             ("d", Column::from_i64(vec![1, 0])),
         ]);
-        let e = binary(col(&schema, "a").unwrap(), BinaryOp::Div, col(&schema, "d").unwrap()).unwrap();
+        let e = binary(
+            col(&schema, "a").unwrap(),
+            BinaryOp::Div,
+            col(&schema, "d").unwrap(),
+        )
+        .unwrap();
         assert!(matches!(eval(&e, &b), Err(EngineError::Arithmetic(_))));
     }
 
@@ -727,7 +921,12 @@ mod tests {
             ("a", Column::from_i64(vec![5, 6])),
             ("d", nullable_i64(vec![0, 2], vec![false, true])),
         ]);
-        let e = binary(col(&schema, "a").unwrap(), BinaryOp::Div, col(&schema, "d").unwrap()).unwrap();
+        let e = binary(
+            col(&schema, "a").unwrap(),
+            BinaryOp::Div,
+            col(&schema, "d").unwrap(),
+        )
+        .unwrap();
         assert_eq!(run(&e, &b), vec![nul(DataType::Int64), int(3)]);
     }
 
@@ -763,22 +962,54 @@ mod tests {
     fn three_valued_and_matches_sql() {
         // Rows: NULL AND false, NULL AND true, true AND NULL, false AND NULL.
         let (schema, b) = setup(vec![
-            ("x", Column::from_bool(vec![false, false, true, false]).with_validity(vec![false, false, true, true])),
-            ("y", Column::from_bool(vec![false, true, false, false]).with_validity(vec![true, true, false, false])),
+            (
+                "x",
+                Column::from_bool(vec![false, false, true, false])
+                    .with_validity(vec![false, false, true, true]),
+            ),
+            (
+                "y",
+                Column::from_bool(vec![false, true, false, false])
+                    .with_validity(vec![true, true, false, false]),
+            ),
         ]);
-        let e = binary(col(&schema, "x").unwrap(), BinaryOp::And, col(&schema, "y").unwrap()).unwrap();
-        assert_eq!(run(&e, &b), vec![fal(), nul(DataType::Boolean), nul(DataType::Boolean), fal()]);
+        let e = binary(
+            col(&schema, "x").unwrap(),
+            BinaryOp::And,
+            col(&schema, "y").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            run(&e, &b),
+            vec![fal(), nul(DataType::Boolean), nul(DataType::Boolean), fal()]
+        );
     }
 
     #[test]
     fn three_valued_or_matches_sql() {
         // Rows: NULL OR true, NULL OR false, true OR NULL, false OR NULL.
         let (schema, b) = setup(vec![
-            ("x", Column::from_bool(vec![false, false, true, false]).with_validity(vec![false, false, true, true])),
-            ("y", Column::from_bool(vec![true, false, false, false]).with_validity(vec![true, true, false, false])),
+            (
+                "x",
+                Column::from_bool(vec![false, false, true, false])
+                    .with_validity(vec![false, false, true, true]),
+            ),
+            (
+                "y",
+                Column::from_bool(vec![true, false, false, false])
+                    .with_validity(vec![true, true, false, false]),
+            ),
         ]);
-        let e = binary(col(&schema, "x").unwrap(), BinaryOp::Or, col(&schema, "y").unwrap()).unwrap();
-        assert_eq!(run(&e, &b), vec![tru(), nul(DataType::Boolean), tru(), nul(DataType::Boolean)]);
+        let e = binary(
+            col(&schema, "x").unwrap(),
+            BinaryOp::Or,
+            col(&schema, "y").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            run(&e, &b),
+            vec![tru(), nul(DataType::Boolean), tru(), nul(DataType::Boolean)]
+        );
     }
 
     #[test]
@@ -795,7 +1026,10 @@ mod tests {
     #[test]
     fn not_keeps_nulls_and_neg_wraps() {
         let (schema, b) = setup(vec![
-            ("p", Column::from_bool(vec![true, false]).with_validity(vec![false, true])),
+            (
+                "p",
+                Column::from_bool(vec![true, false]).with_validity(vec![false, true]),
+            ),
             ("n", Column::from_i64(vec![i64::MIN, 5])),
         ]);
         let not = unary(UnaryOp::Not, col(&schema, "p").unwrap()).unwrap();
@@ -806,7 +1040,10 @@ mod tests {
 
     #[test]
     fn utf8_comparison_is_byte_lexicographic() {
-        let (schema, b) = setup(vec![("s", Column::from_strs(&["Z", "a", "abc", "abd", "ab"]))]);
+        let (schema, b) = setup(vec![(
+            "s",
+            Column::from_strs(&["Z", "a", "abc", "abd", "ab"]),
+        )]);
         let lt = binary(col(&schema, "s").unwrap(), BinaryOp::Lt, s("abc")).unwrap();
         let eq = binary(col(&schema, "s").unwrap(), BinaryOp::Eq, s("abc")).unwrap();
         // "a" < "abc" is true: a shorter prefix sorts first.
@@ -828,10 +1065,18 @@ mod tests {
     #[test]
     fn case_takes_else_for_false_and_null_conditions() {
         let (schema, b) = setup(vec![
-            ("c", Column::from_bool(vec![true, false, false]).with_validity(vec![true, false, true])),
+            (
+                "c",
+                Column::from_bool(vec![true, false, false]).with_validity(vec![true, false, true]),
+            ),
             ("e", Column::from_i64(vec![1, 2, 3])),
         ]);
-        let e = case(col(&schema, "c").unwrap(), i(10), col(&schema, "e").unwrap()).unwrap();
+        let e = case(
+            col(&schema, "c").unwrap(),
+            i(10),
+            col(&schema, "e").unwrap(),
+        )
+        .unwrap();
         assert_eq!(e.return_type(), DataType::Int64);
         assert_eq!(run(&e, &b), vec![int(10), int(2), int(3)]);
     }
@@ -860,27 +1105,65 @@ mod tests {
     #[test]
     fn case_rejects_non_boolean_condition_and_incompatible_branches() {
         assert!(matches!(case(i(1), i(1), i(2)), Err(EngineError::Type(_))));
-        assert!(matches!(case(bool_lit(true), i(1), s("x")), Err(EngineError::Type(_))));
+        assert!(matches!(
+            case(bool_lit(true), i(1), s("x")),
+            Err(EngineError::Type(_))
+        ));
     }
 
     #[test]
     fn in_list_follows_three_valued_logic() {
-        let (schema, b) = setup(vec![("x", nullable_i64(vec![1, 2, 3, 0], vec![true, true, true, false]))]);
+        let (schema, b) = setup(vec![(
+            "x",
+            nullable_i64(vec![1, 2, 3, 0], vec![true, true, true, false]),
+        )]);
         let x = col(&schema, "x").unwrap();
         let list = vec![i(2), lit(nul(DataType::Int64))];
-        let e = Expr::InList { expr: Box::new(x.clone()), list: list.clone(), negated: false };
-        let neg = Expr::InList { expr: Box::new(x.clone()), list, negated: true };
+        let e = Expr::InList {
+            expr: Box::new(x.clone()),
+            list: list.clone(),
+            negated: false,
+        };
+        let neg = Expr::InList {
+            expr: Box::new(x.clone()),
+            list,
+            negated: true,
+        };
         // 1 IN (2, NULL) is NULL; 2 IN (2, NULL) is TRUE; NULL IN (...) is NULL.
-        assert_eq!(run(&e, &b), vec![nul(DataType::Boolean), tru(), nul(DataType::Boolean), nul(DataType::Boolean)]);
-        assert_eq!(run(&neg, &b), vec![nul(DataType::Boolean), fal(), nul(DataType::Boolean), nul(DataType::Boolean)]);
+        assert_eq!(
+            run(&e, &b),
+            vec![
+                nul(DataType::Boolean),
+                tru(),
+                nul(DataType::Boolean),
+                nul(DataType::Boolean)
+            ]
+        );
+        assert_eq!(
+            run(&neg, &b),
+            vec![
+                nul(DataType::Boolean),
+                fal(),
+                nul(DataType::Boolean),
+                nul(DataType::Boolean)
+            ]
+        );
     }
 
     #[test]
     fn in_list_without_null_items_is_two_valued() {
         let (schema, b) = setup(vec![("x", Column::from_i64(vec![1, 2, 3]))]);
         let x = col(&schema, "x").unwrap();
-        let e = Expr::InList { expr: Box::new(x.clone()), list: vec![i(2), i(3)], negated: false };
-        let neg = Expr::InList { expr: Box::new(x), list: vec![i(2), i(3)], negated: true };
+        let e = Expr::InList {
+            expr: Box::new(x.clone()),
+            list: vec![i(2), i(3)],
+            negated: false,
+        };
+        let neg = Expr::InList {
+            expr: Box::new(x),
+            list: vec![i(2), i(3)],
+            negated: true,
+        };
         assert_eq!(run(&e, &b), vec![fal(), tru(), tru()]);
         assert_eq!(run(&neg, &b), vec![tru(), fal(), fal()]);
     }
@@ -918,7 +1201,10 @@ mod tests {
     fn cast_to_utf8_formats_each_type() {
         let (schema, b) = setup(vec![
             ("b", Column::from_bool(vec![true, false])),
-            ("i", Column::from_i64(vec![42, 0]).with_validity(vec![true, false])),
+            (
+                "i",
+                Column::from_i64(vec![42, 0]).with_validity(vec![true, false]),
+            ),
             ("f", Column::from_f64(vec![1.5, 2.0])),
         ]);
         let bs = cast(col(&schema, "b").unwrap(), DataType::Utf8).unwrap();
@@ -926,15 +1212,30 @@ mod tests {
         let fs = cast(col(&schema, "f").unwrap(), DataType::Utf8).unwrap();
         assert_eq!(
             run(&bs, &b),
-            vec![ScalarValue::Utf8("true".into()), ScalarValue::Utf8("false".into())]
+            vec![
+                ScalarValue::Utf8("true".into()),
+                ScalarValue::Utf8("false".into())
+            ]
         );
-        assert_eq!(run(&is, &b), vec![ScalarValue::Utf8("42".into()), nul(DataType::Utf8)]);
-        assert_eq!(run(&fs, &b), vec![ScalarValue::Utf8("1.5".into()), ScalarValue::Utf8("2".into())]);
+        assert_eq!(
+            run(&is, &b),
+            vec![ScalarValue::Utf8("42".into()), nul(DataType::Utf8)]
+        );
+        assert_eq!(
+            run(&fs, &b),
+            vec![
+                ScalarValue::Utf8("1.5".into()),
+                ScalarValue::Utf8("2".into())
+            ]
+        );
     }
 
     #[test]
     fn cast_boolean_to_int_is_type_error() {
-        assert!(matches!(cast(bool_lit(true), DataType::Int64), Err(EngineError::Type(_))));
+        assert!(matches!(
+            cast(bool_lit(true), DataType::Int64),
+            Err(EngineError::Type(_))
+        ));
     }
 
     #[test]
@@ -958,12 +1259,20 @@ mod tests {
     fn literals_broadcast_to_batch_row_count() {
         let (_, b) = setup(vec![("a", Column::from_i64(vec![0, 0, 0, 0]))]);
         assert_eq!(run(&i(7), &b), vec![int(7); 4]);
-        assert_eq!(run(&lit(nul(DataType::Utf8)), &b), vec![nul(DataType::Utf8); 4]);
+        assert_eq!(
+            run(&lit(nul(DataType::Utf8)), &b),
+            vec![nul(DataType::Utf8); 4]
+        );
     }
 
     #[test]
     fn optimize_folds_literal_only_subtree() {
-        let e = binary(i(2), BinaryOp::Mul, binary(i(3), BinaryOp::Add, i(4)).unwrap()).unwrap();
+        let e = binary(
+            i(2),
+            BinaryOp::Mul,
+            binary(i(3), BinaryOp::Add, i(4)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(optimize(e), i(14));
     }
 
@@ -1009,7 +1318,13 @@ mod tests {
         schema: &'a Schema,
     }
 
-    const ARITH: [BinaryOp; 5] = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div, BinaryOp::Mod];
+    const ARITH: [BinaryOp; 5] = [
+        BinaryOp::Add,
+        BinaryOp::Sub,
+        BinaryOp::Mul,
+        BinaryOp::Div,
+        BinaryOp::Mod,
+    ];
     const CMP: [BinaryOp; 6] = [
         BinaryOp::Eq,
         BinaryOp::NotEq,
@@ -1019,7 +1334,16 @@ mod tests {
         BinaryOp::GtEq,
     ];
     const INT_POOL: [i64; 7] = [0, 1, -1, 2, 7, i64::MAX, i64::MIN];
-    const FLOAT_POOL: [f64; 8] = [0.0, -0.0, 1.0, 2.5, -3.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+    const FLOAT_POOL: [f64; 8] = [
+        0.0,
+        -0.0,
+        1.0,
+        2.5,
+        -3.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
     const STR_POOL: [&str; 5] = ["", "a", "abc", "zz", "a very long string over twelve bytes"];
 
     impl Gen<'_> {
@@ -1032,7 +1356,12 @@ mod tests {
                 return lit(nul(dt));
             }
             let schema = self.schema;
-            let names: Vec<&str> = schema.fields.iter().filter(|f| f.data_type == dt).map(|f| f.name.as_str()).collect();
+            let names: Vec<&str> = schema
+                .fields
+                .iter()
+                .filter(|f| f.data_type == dt)
+                .map(|f| f.name.as_str())
+                .collect();
             if !names.is_empty() && self.rng.gen_bool(0.6) {
                 let name = self.pick(&names);
                 return col(schema, name).unwrap();
@@ -1067,7 +1396,11 @@ mod tests {
                         case(c, t, e).unwrap()
                     }
                     _ => {
-                        let src = if self.rng.gen_bool(0.5) { DataType::Float64 } else { DataType::Utf8 };
+                        let src = if self.rng.gen_bool(0.5) {
+                            DataType::Float64
+                        } else {
+                            DataType::Utf8
+                        };
                         let x = self.expr(src, d);
                         cast(x, DataType::Int64).unwrap()
                     }
@@ -1076,7 +1409,11 @@ mod tests {
                     0 => {
                         let op = self.pick(&ARITH);
                         let l = self.expr(DataType::Float64, d);
-                        let r_type = if self.rng.gen_bool(0.5) { DataType::Int64 } else { DataType::Float64 };
+                        let r_type = if self.rng.gen_bool(0.5) {
+                            DataType::Int64
+                        } else {
+                            DataType::Float64
+                        };
                         let r = self.expr(r_type, d);
                         binary(l, op, r).unwrap()
                     }
@@ -1086,7 +1423,10 @@ mod tests {
                     }
                     2 => {
                         let c = self.expr(DataType::Boolean, d);
-                        let (t, e) = (self.expr(DataType::Float64, d), self.expr(DataType::Float64, d));
+                        let (t, e) = (
+                            self.expr(DataType::Float64, d),
+                            self.expr(DataType::Float64, d),
+                        );
                         case(c, t, e).unwrap()
                     }
                     _ => {
@@ -1096,8 +1436,15 @@ mod tests {
                 },
                 DataType::Boolean => match self.rng.gen_range(0..6) {
                     0 => {
-                        let op = if self.rng.gen_bool(0.5) { BinaryOp::And } else { BinaryOp::Or };
-                        let (l, r) = (self.expr(DataType::Boolean, d), self.expr(DataType::Boolean, d));
+                        let op = if self.rng.gen_bool(0.5) {
+                            BinaryOp::And
+                        } else {
+                            BinaryOp::Or
+                        };
+                        let (l, r) = (
+                            self.expr(DataType::Boolean, d),
+                            self.expr(DataType::Boolean, d),
+                        );
                         binary(l, op, r).unwrap()
                     }
                     1 => {
@@ -1115,17 +1462,30 @@ mod tests {
                         binary(l, op, r).unwrap()
                     }
                     4 => {
-                        let any = [DataType::Int64, DataType::Float64, DataType::Boolean, DataType::Utf8];
+                        let any = [
+                            DataType::Int64,
+                            DataType::Float64,
+                            DataType::Boolean,
+                            DataType::Utf8,
+                        ];
                         let dt = self.pick(&any);
                         let x = self.expr(dt, d);
-                        let op = if self.rng.gen_bool(0.5) { UnaryOp::IsNull } else { UnaryOp::IsNotNull };
+                        let op = if self.rng.gen_bool(0.5) {
+                            UnaryOp::IsNull
+                        } else {
+                            UnaryOp::IsNotNull
+                        };
                         unary(op, x).unwrap()
                     }
                     _ => {
                         let x = self.expr(DataType::Int64, d);
                         let n = self.rng.gen_range(0..4);
                         let list = (0..n).map(|_| self.expr(DataType::Int64, d)).collect();
-                        Expr::InList { expr: Box::new(x), list, negated: self.rng.gen_bool(0.5) }
+                        Expr::InList {
+                            expr: Box::new(x),
+                            list,
+                            negated: self.rng.gen_bool(0.5),
+                        }
                     }
                 },
                 DataType::Utf8 => match self.rng.gen_range(0..3) {
@@ -1148,17 +1508,38 @@ mod tests {
     }
 
     fn random_batch(rng: &mut StdRng, n: usize) -> (Schema, Batch) {
-        let validity = |rng: &mut StdRng| -> Vec<bool> { (0..n).map(|_| !rng.gen_bool(0.15)).collect() };
+        let validity =
+            |rng: &mut StdRng| -> Vec<bool> { (0..n).map(|_| !rng.gen_bool(0.15)).collect() };
         let i0: Vec<i64> = (0..n)
-            .map(|_| if rng.gen_bool(0.05) { i64::MAX } else { rng.gen_range(-3..4) })
+            .map(|_| {
+                if rng.gen_bool(0.05) {
+                    i64::MAX
+                } else {
+                    rng.gen_range(-3..4)
+                }
+            })
             .collect();
         let i1: Vec<i64> = (0..n).map(|_| rng.gen_range(-2..3)).collect();
         let f0: Vec<f64> = (0..n)
-            .map(|_| if rng.gen_bool(0.1) { FLOAT_POOL[rng.gen_range(0..FLOAT_POOL.len())] } else { rng.gen_range(-3.0..3.0) })
+            .map(|_| {
+                if rng.gen_bool(0.1) {
+                    FLOAT_POOL[rng.gen_range(0..FLOAT_POOL.len())]
+                } else {
+                    rng.gen_range(-3.0..3.0)
+                }
+            })
             .collect();
         let b0: Vec<bool> = (0..n).map(|_| rng.gen_bool(0.5)).collect();
-        let s0: Vec<&str> = (0..n).map(|_| STR_POOL[rng.gen_range(0..STR_POOL.len())]).collect();
-        let v = (validity(rng), validity(rng), validity(rng), validity(rng), validity(rng));
+        let s0: Vec<&str> = (0..n)
+            .map(|_| STR_POOL[rng.gen_range(0..STR_POOL.len())])
+            .collect();
+        let v = (
+            validity(rng),
+            validity(rng),
+            validity(rng),
+            validity(rng),
+            validity(rng),
+        );
         setup(vec![
             ("i0", Column::from_i64(i0).with_validity(v.0)),
             ("i1", Column::from_i64(i1).with_validity(v.1)),
@@ -1175,7 +1556,9 @@ mod tests {
                 x.data_type() == y.data_type()
                     && x.len() == y.len()
                     && (0..x.len()).all(|i| match (x.get(i), y.get(i)) {
-                        (ScalarValue::Float64(p), ScalarValue::Float64(q)) => p.to_bits() == q.to_bits(),
+                        (ScalarValue::Float64(p), ScalarValue::Float64(q)) => {
+                            p.to_bits() == q.to_bits()
+                        }
                         (p, q) => p == q,
                     })
             }
@@ -1190,11 +1573,23 @@ mod tests {
         for _ in 0..40 {
             let (schema, batch) = random_batch(&mut rng, 48);
             for _ in 0..100 {
-                let dt = [DataType::Int64, DataType::Float64, DataType::Boolean, DataType::Utf8]
-                    [rng.gen_range(0..4)];
-                let expr = Gen { rng: &mut rng, schema: &schema }.expr(dt, 4);
+                let dt = [
+                    DataType::Int64,
+                    DataType::Float64,
+                    DataType::Boolean,
+                    DataType::Utf8,
+                ][rng.gen_range(0..4)];
+                let expr = Gen {
+                    rng: &mut rng,
+                    schema: &schema,
+                }
+                .expr(dt, 4);
                 let optimized = optimize(expr.clone());
-                assert_eq!(optimized.return_type(), expr.return_type(), "optimize changed type of {expr:?}");
+                assert_eq!(
+                    optimized.return_type(),
+                    expr.return_type(),
+                    "optimize changed type of {expr:?}"
+                );
                 let before = eval(&expr, &batch);
                 let after = eval(&optimized, &batch);
                 assert!(
@@ -1207,6 +1602,9 @@ mod tests {
             }
         }
         // Guard against a generator that only produces erroring expressions.
-        assert!(ok_count > 500, "only {ok_count} of 4000 random expressions evaluated successfully");
+        assert!(
+            ok_count > 500,
+            "only {ok_count} of 4000 random expressions evaluated successfully"
+        );
     }
 }

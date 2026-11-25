@@ -4,10 +4,17 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use crate::expr::{BinaryOp, Expr};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Tier { Vectorized, Jit }
+pub enum Tier {
+    Vectorized,
+    Jit,
+}
 
 #[derive(Debug, Clone, Copy)]
-pub struct CostParams { pub t_vec_tuple_ns: f64, pub t_jit_tuple_ns: f64, pub t_comp_ns: f64 }
+pub struct CostParams {
+    pub t_vec_tuple_ns: f64,
+    pub t_jit_tuple_ns: f64,
+    pub t_comp_ns: f64,
+}
 
 // shortcut: weights are uncalibrated research estimates (RFC-0001 §5.2 shape: 2.0 depth, 1.0 node,
 // 3.5 branch, 1.5 cast), not measured on any target. Recalibrate per machine before trusting a crossover.
@@ -37,10 +44,20 @@ fn operator_depth(expr: &Expr) -> usize {
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => 1 + operator_depth(expr),
         Expr::Binary { left, right, .. } => 1 + operator_depth(left).max(operator_depth(right)),
         Expr::InList { expr, list, .. } => {
-            1 + list.iter().map(operator_depth).fold(operator_depth(expr), usize::max)
+            1 + list
+                .iter()
+                .map(operator_depth)
+                .fold(operator_depth(expr), usize::max)
         }
-        Expr::Case { condition, then_expr, else_expr, .. } => {
-            1 + operator_depth(condition).max(operator_depth(then_expr)).max(operator_depth(else_expr))
+        Expr::Case {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            1 + operator_depth(condition)
+                .max(operator_depth(then_expr))
+                .max(operator_depth(else_expr))
         }
     }
 }
@@ -50,7 +67,10 @@ fn weighted_nodes(expr: &Expr) -> f64 {
     let own = match expr {
         Expr::Column { .. } | Expr::Literal(_) => 0.0,
         Expr::Unary { .. } => W_NODE,
-        Expr::Binary { op: BinaryOp::Div | BinaryOp::Mod, .. } => W_DIV_MOD,
+        Expr::Binary {
+            op: BinaryOp::Div | BinaryOp::Mod,
+            ..
+        } => W_DIV_MOD,
         Expr::Binary { .. } => W_NODE,
         Expr::Cast { .. } => W_CAST,
         Expr::Case { .. } => W_CASE,
@@ -63,9 +83,12 @@ fn weighted_nodes(expr: &Expr) -> f64 {
         Expr::InList { expr, list, .. } => {
             weighted_nodes(expr) + list.iter().map(weighted_nodes).sum::<f64>()
         }
-        Expr::Case { condition, then_expr, else_expr, .. } => {
-            weighted_nodes(condition) + weighted_nodes(then_expr) + weighted_nodes(else_expr)
-        }
+        Expr::Case {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => weighted_nodes(condition) + weighted_nodes(then_expr) + weighted_nodes(else_expr),
     };
     own + children
 }
@@ -73,7 +96,9 @@ fn weighted_nodes(expr: &Expr) -> f64 {
 /// Crossover cardinality N = ceil(T_comp / Δt), Δt = t_vec - t_jit (RFC §5, COST_MODEL §3).
 /// None when JIT can never pay off: Δt <= 0, any non-finite or negative input, or a quotient that overflows.
 pub fn crossover(p: &CostParams) -> Option<f64> {
-    let finite = [p.t_vec_tuple_ns, p.t_jit_tuple_ns, p.t_comp_ns].iter().all(|v| v.is_finite());
+    let finite = [p.t_vec_tuple_ns, p.t_jit_tuple_ns, p.t_comp_ns]
+        .iter()
+        .all(|v| v.is_finite());
     if !finite || p.t_comp_ns < 0.0 {
         return None;
     }
@@ -112,16 +137,25 @@ pub struct AdaptiveTier {
 
 impl AdaptiveTier {
     pub fn new(p: CostParams) -> Self {
-        AdaptiveTier { trigger: trigger_for(&p), seen: AtomicU64::new(0), state: AtomicU8::new(TIER_VECTORIZED) }
+        AdaptiveTier {
+            trigger: trigger_for(&p),
+            seen: AtomicU64::new(0),
+            state: AtomicU8::new(TIER_VECTORIZED),
+        }
     }
 
     /// Record `tuples` processed. Returns true only for the single call that performed the flip.
     pub fn observe(&self, tuples: u64) -> bool {
-        let Some(trigger) = self.trigger else { return false };
+        let Some(trigger) = self.trigger else {
+            return false;
+        };
         let mut prev = self.seen.load(Ordering::Relaxed);
         let total = loop {
             let next = prev.saturating_add(tuples);
-            match self.seen.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            match self
+                .seen
+                .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break next,
                 Err(actual) => prev = actual,
             }
@@ -130,7 +164,12 @@ impl AdaptiveTier {
             return false;
         }
         self.state
-            .compare_exchange(TIER_VECTORIZED, TIER_JIT, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                TIER_VECTORIZED,
+                TIER_JIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 
@@ -150,11 +189,19 @@ mod tests {
     use std::thread;
 
     fn params(t_vec: f64, t_jit: f64, t_comp: f64) -> CostParams {
-        CostParams { t_vec_tuple_ns: t_vec, t_jit_tuple_ns: t_jit, t_comp_ns: t_comp }
+        CostParams {
+            t_vec_tuple_ns: t_vec,
+            t_jit_tuple_ns: t_jit,
+            t_comp_ns: t_comp,
+        }
     }
 
     fn col(name: &str) -> Expr {
-        Expr::Column { name: name.into(), index: 0, data_type: DataType::Int64 }
+        Expr::Column {
+            name: name.into(),
+            index: 0,
+            data_type: DataType::Int64,
+        }
     }
 
     fn lit(v: i64) -> Expr {
@@ -162,7 +209,12 @@ mod tests {
     }
 
     fn bin(left: Expr, op: BinaryOp, right: Expr) -> Expr {
-        Expr::Binary { left: Box::new(left), op, right: Box::new(right), return_type: DataType::Boolean }
+        Expr::Binary {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+            return_type: DataType::Boolean,
+        }
     }
 
     #[test]
@@ -234,8 +286,14 @@ mod tests {
 
     #[test]
     fn choose_tier_never_jit_without_crossover() {
-        assert_eq!(choose_tier(&params(5.0, 5.0, 100.0), u64::MAX), Tier::Vectorized);
-        assert_eq!(choose_tier(&params(f64::NAN, 1.0, 100.0), u64::MAX), Tier::Vectorized);
+        assert_eq!(
+            choose_tier(&params(5.0, 5.0, 100.0), u64::MAX),
+            Tier::Vectorized
+        );
+        assert_eq!(
+            choose_tier(&params(f64::NAN, 1.0, 100.0), u64::MAX),
+            Tier::Vectorized
+        );
     }
 
     #[test]
@@ -256,7 +314,11 @@ mod tests {
         let mut e = col("a");
         let mut prev = eci(&e);
         for i in 0..20 {
-            let op = if i % 2 == 0 { BinaryOp::Add } else { BinaryOp::Mul };
+            let op = if i % 2 == 0 {
+                BinaryOp::Add
+            } else {
+                BinaryOp::Mul
+            };
             e = bin(e, op, lit(i));
             let now = eci(&e);
             assert!(now >= prev, "eci dropped from {prev} to {now} at step {i}");
@@ -281,7 +343,10 @@ mod tests {
         };
         // depth 2 (Case over Gt) -> 4.0; nodes Case 4.5 + Gt 1.0 -> 9.5 total.
         assert_eq!(eci(&case), 9.5);
-        let cast = Expr::Cast { expr: Box::new(col("a")), target_type: DataType::Float64 };
+        let cast = Expr::Cast {
+            expr: Box::new(col("a")),
+            target_type: DataType::Float64,
+        };
         // depth 1 -> 2.0; Cast node 2.5 -> 4.5.
         assert_eq!(eci(&cast), 4.5);
     }
@@ -289,7 +354,11 @@ mod tests {
     #[test]
     fn eci_depth_term_penalizes_deeper_tree_of_same_op_count() {
         // Same three Add nodes; right-leaning chain is deeper than a balanced tree.
-        let chain = bin(bin(bin(col("a"), BinaryOp::Add, lit(1)), BinaryOp::Add, lit(2)), BinaryOp::Add, lit(3));
+        let chain = bin(
+            bin(bin(col("a"), BinaryOp::Add, lit(1)), BinaryOp::Add, lit(2)),
+            BinaryOp::Add,
+            lit(3),
+        );
         let balanced = bin(
             bin(col("a"), BinaryOp::Add, lit(1)),
             BinaryOp::Add,
@@ -300,7 +369,11 @@ mod tests {
 
     #[test]
     fn eci_in_list_is_counted_as_heavy_node() {
-        let e = Expr::InList { expr: Box::new(col("a")), list: vec![lit(1), lit(2)], negated: false };
+        let e = Expr::InList {
+            expr: Box::new(col("a")),
+            list: vec![lit(1), lit(2)],
+            negated: false,
+        };
         assert_eq!(eci(&e), 2.0 * 1.0 + W_IN_LIST);
     }
 
@@ -315,7 +388,10 @@ mod tests {
         // crossover 5e6 -> 0.1 * 5e6 = 500k, capped at 100k.
         assert_eq!(trigger_for(&params(10.0, 2.6, 42.0e6)), Some(100_000));
         // crossover 200_000 -> 0.1 * 200k = 20k (below the cap).
-        assert_eq!(trigger_for(&params(10.0, 6.0, 200_000.0 * 4.0)), Some(20_000));
+        assert_eq!(
+            trigger_for(&params(10.0, 6.0, 200_000.0 * 4.0)),
+            Some(20_000)
+        );
         assert_eq!(trigger_for(&params(5.0, 5.0, 1.0)), None);
     }
 

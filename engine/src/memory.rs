@@ -22,7 +22,11 @@ pub struct Reservation {
 
 impl MemoryBudget {
     pub fn new(limit_bytes: usize) -> Arc<MemoryBudget> {
-        Arc::new(MemoryBudget { used: AtomicUsize::new(0), limit: limit_bytes, parent: None })
+        Arc::new(MemoryBudget {
+            used: AtomicUsize::new(0),
+            limit: limit_bytes,
+            parent: None,
+        })
     }
 
     /// Child budget: its reservations also count against the parent; `limit_bytes` caps the child.
@@ -37,7 +41,10 @@ impl MemoryBudget {
     /// Err(EngineError::Memory{..}) when the reservation would exceed this or any ancestor limit. Never partial.
     pub fn try_reserve(self: &Arc<Self>, bytes: usize) -> Result<Reservation> {
         self.reserve_chain(bytes)?;
-        Ok(Reservation { budget: Arc::clone(self), size: bytes })
+        Ok(Reservation {
+            budget: Arc::clone(self),
+            size: bytes,
+        })
     }
 
     /// Bytes charged at this level (includes reservations made through child budgets).
@@ -82,7 +89,12 @@ impl MemoryBudget {
                     available: self.limit.saturating_sub(current),
                 });
             };
-            match self.used.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return Ok(()),
                 Err(actual) => current = actual,
             }
@@ -144,7 +156,13 @@ mod tests {
         let b = MemoryBudget::new(100);
         let _held = b.try_reserve(70).unwrap();
         let err = b.try_reserve(31).unwrap_err();
-        assert_eq!(err, EngineError::Memory { requested: 31, available: 30 });
+        assert_eq!(
+            err,
+            EngineError::Memory {
+                requested: 31,
+                available: 30
+            }
+        );
         assert_eq!(b.used(), 70);
     }
 
@@ -266,7 +284,10 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert!(!violated.load(Ordering::SeqCst), "limit exceeded under contention");
+        assert!(
+            !violated.load(Ordering::SeqCst),
+            "limit exceeded under contention"
+        );
         assert_eq!(budget.used(), 0);
         assert_eq!(held_total.load(Ordering::SeqCst), 0);
     }

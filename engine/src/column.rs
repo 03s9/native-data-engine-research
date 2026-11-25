@@ -46,7 +46,10 @@ impl StringViews {
             if b.len() <= 12 {
                 data[..b.len()].copy_from_slice(b);
             } else {
-                if buffers.last().is_some_and(|cur| cur.len() + b.len() > limit) {
+                if buffers
+                    .last()
+                    .is_some_and(|cur| cur.len() + b.len() > limit)
+                {
                     buffers.push(Vec::new());
                 }
                 let bi = buffers.len() - 1;
@@ -57,9 +60,15 @@ impl StringViews {
                 data[8..12].copy_from_slice(&off.to_le_bytes());
                 buffers[bi].extend_from_slice(b);
             }
-            views.push(View { len: b.len() as u32, data });
+            views.push(View {
+                len: b.len() as u32,
+                data,
+            });
         }
-        StringViews { views, buffers: buffers.into_iter().map(Arc::new).collect() }
+        StringViews {
+            views,
+            buffers: buffers.into_iter().map(Arc::new).collect(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -128,16 +137,28 @@ pub struct Column {
 
 impl Column {
     pub fn from_bool(v: Vec<bool>) -> Self {
-        Column { values: Values::Bool(v), validity: None }
+        Column {
+            values: Values::Bool(v),
+            validity: None,
+        }
     }
     pub fn from_i64(v: Vec<i64>) -> Self {
-        Column { values: Values::Int64(v), validity: None }
+        Column {
+            values: Values::Int64(v),
+            validity: None,
+        }
     }
     pub fn from_f64(v: Vec<f64>) -> Self {
-        Column { values: Values::Float64(v), validity: None }
+        Column {
+            values: Values::Float64(v),
+            validity: None,
+        }
     }
     pub fn from_strs<S: AsRef<str>>(v: &[S]) -> Self {
-        Column { values: Values::Utf8(StringViews::from_strs(v)), validity: None }
+        Column {
+            values: Values::Utf8(StringViews::from_strs(v)),
+            validity: None,
+        }
     }
     pub fn with_validity(mut self, validity: Vec<bool>) -> Self {
         assert_eq!(validity.len(), self.len());
@@ -186,36 +207,52 @@ impl Column {
         let bad = |s: &ScalarValue| EngineError::Type(format!("scalar {s:?} is not {dt:?}"));
         let values = match dt {
             DataType::Boolean => Values::Bool(
-                items.iter().map(|s| match s {
-                    ScalarValue::Boolean(b) => Ok(*b),
-                    ScalarValue::Null(_) => Ok(false),
-                    o => Err(bad(o)),
-                }).collect::<Result<_>>()?,
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Boolean(b) => Ok(*b),
+                        ScalarValue::Null(_) => Ok(false),
+                        o => Err(bad(o)),
+                    })
+                    .collect::<Result<_>>()?,
             ),
             DataType::Int64 => Values::Int64(
-                items.iter().map(|s| match s {
-                    ScalarValue::Int64(b) => Ok(*b),
-                    ScalarValue::Null(_) => Ok(0),
-                    o => Err(bad(o)),
-                }).collect::<Result<_>>()?,
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Int64(b) => Ok(*b),
+                        ScalarValue::Null(_) => Ok(0),
+                        o => Err(bad(o)),
+                    })
+                    .collect::<Result<_>>()?,
             ),
             DataType::Float64 => Values::Float64(
-                items.iter().map(|s| match s {
-                    ScalarValue::Float64(b) => Ok(*b),
-                    ScalarValue::Null(_) => Ok(0.0),
-                    o => Err(bad(o)),
-                }).collect::<Result<_>>()?,
+                items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Float64(b) => Ok(*b),
+                        ScalarValue::Null(_) => Ok(0.0),
+                        o => Err(bad(o)),
+                    })
+                    .collect::<Result<_>>()?,
             ),
             DataType::Utf8 => {
-                let strs: Vec<&str> = items.iter().map(|s| match s {
-                    ScalarValue::Utf8(b) => Ok(b.as_str()),
-                    ScalarValue::Null(_) => Ok(""),
-                    o => Err(bad(o)),
-                }).collect::<Result<_>>()?;
+                let strs: Vec<&str> = items
+                    .iter()
+                    .map(|s| match s {
+                        ScalarValue::Utf8(b) => Ok(b.as_str()),
+                        ScalarValue::Null(_) => Ok(""),
+                        o => Err(bad(o)),
+                    })
+                    .collect::<Result<_>>()?;
                 Values::Utf8(StringViews::from_strs(&strs))
             }
         };
-        let validity = if validity.iter().all(|v| *v) { None } else { Some(validity) };
+        let validity = if validity.iter().all(|v| *v) {
+            None
+        } else {
+            Some(validity)
+        };
         Ok(Column { values, validity })
     }
 
@@ -226,13 +263,21 @@ impl Column {
             Values::Float64(v) => Values::Float64(idx.iter().map(|&i| v[i]).collect()),
             Values::Utf8(v) => Values::Utf8(v.take(idx)),
         };
-        let validity = self.validity.as_ref().map(|m| idx.iter().map(|&i| m[i]).collect());
+        let validity = self
+            .validity
+            .as_ref()
+            .map(|m| idx.iter().map(|&i| m[i]).collect());
         Column { values, validity }
     }
 
     /// Keep rows where mask[i] is true (null mask rows are the caller's concern).
     pub fn filter(&self, mask: &[bool]) -> Column {
-        let idx: Vec<usize> = mask.iter().enumerate().filter(|(_, m)| **m).map(|(i, _)| i).collect();
+        let idx: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m)
+            .map(|(i, _)| i)
+            .collect();
         self.take(&idx)
     }
 
@@ -243,22 +288,59 @@ impl Column {
     }
 
     pub fn concat(parts: &[&Column]) -> Result<Column> {
-        let first = parts.first().ok_or_else(|| EngineError::Plan("concat of zero columns".into()))?;
+        let first = parts
+            .first()
+            .ok_or_else(|| EngineError::Plan("concat of zero columns".into()))?;
         let dt = first.data_type();
         if parts.iter().any(|c| c.data_type() != dt) {
             return Err(EngineError::Type("concat of mixed column types".into()));
         }
         let values = match dt {
-            DataType::Boolean => Values::Bool(parts.iter().flat_map(|c| match &c.values { Values::Bool(v) => v.clone(), _ => vec![] }).collect()),
-            DataType::Int64 => Values::Int64(parts.iter().flat_map(|c| match &c.values { Values::Int64(v) => v.clone(), _ => vec![] }).collect()),
-            DataType::Float64 => Values::Float64(parts.iter().flat_map(|c| match &c.values { Values::Float64(v) => v.clone(), _ => vec![] }).collect()),
+            DataType::Boolean => Values::Bool(
+                parts
+                    .iter()
+                    .flat_map(|c| match &c.values {
+                        Values::Bool(v) => v.clone(),
+                        _ => vec![],
+                    })
+                    .collect(),
+            ),
+            DataType::Int64 => Values::Int64(
+                parts
+                    .iter()
+                    .flat_map(|c| match &c.values {
+                        Values::Int64(v) => v.clone(),
+                        _ => vec![],
+                    })
+                    .collect(),
+            ),
+            DataType::Float64 => Values::Float64(
+                parts
+                    .iter()
+                    .flat_map(|c| match &c.values {
+                        Values::Float64(v) => v.clone(),
+                        _ => vec![],
+                    })
+                    .collect(),
+            ),
             DataType::Utf8 => {
-                let sv: Vec<&StringViews> = parts.iter().filter_map(|c| match &c.values { Values::Utf8(v) => Some(v), _ => None }).collect();
+                let sv: Vec<&StringViews> = parts
+                    .iter()
+                    .filter_map(|c| match &c.values {
+                        Values::Utf8(v) => Some(v),
+                        _ => None,
+                    })
+                    .collect();
                 Values::Utf8(StringViews::concat(&sv))
             }
         };
         let validity = if parts.iter().any(|c| c.validity.is_some()) {
-            Some(parts.iter().flat_map(|c| (0..c.len()).map(|i| c.is_valid(i))).collect())
+            Some(
+                parts
+                    .iter()
+                    .flat_map(|c| (0..c.len()).map(|i| c.is_valid(i)))
+                    .collect(),
+            )
         } else {
             None
         };
@@ -281,19 +363,39 @@ impl Batch {
         let num_rows = columns.first().map_or(0, |c| c.len());
         for (f, c) in schema.fields.iter().zip(&columns) {
             if c.len() != num_rows || c.data_type() != f.data_type {
-                return Err(EngineError::Type(format!("column '{}' length/type mismatch", f.name)));
+                return Err(EngineError::Type(format!(
+                    "column '{}' length/type mismatch",
+                    f.name
+                )));
             }
         }
-        Ok(Batch { schema, columns, num_rows })
+        Ok(Batch {
+            schema,
+            columns,
+            num_rows,
+        })
     }
     pub fn empty(schema: SchemaRef) -> Self {
-        Batch { schema, columns: vec![], num_rows: 0 }
+        Batch {
+            schema,
+            columns: vec![],
+            num_rows: 0,
+        }
     }
     pub fn take(&self, idx: &[usize]) -> Batch {
-        Batch { schema: self.schema.clone(), columns: self.columns.iter().map(|c| c.take(idx)).collect(), num_rows: idx.len() }
+        Batch {
+            schema: self.schema.clone(),
+            columns: self.columns.iter().map(|c| c.take(idx)).collect(),
+            num_rows: idx.len(),
+        }
     }
     pub fn filter(&self, mask: &[bool]) -> Batch {
-        let idx: Vec<usize> = mask.iter().enumerate().filter(|(_, m)| **m).map(|(i, _)| i).collect();
+        let idx: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m)
+            .map(|(i, _)| i)
+            .collect();
         self.take(&idx)
     }
     pub fn slice(&self, offset: usize, len: usize) -> Batch {
@@ -301,20 +403,42 @@ impl Batch {
         self.take(&idx)
     }
     pub fn project(&self, cols: &[usize], schema: SchemaRef) -> Batch {
-        Batch { schema, columns: cols.iter().map(|&i| self.columns[i].clone()).collect(), num_rows: self.num_rows }
+        Batch {
+            schema,
+            columns: cols.iter().map(|&i| self.columns[i].clone()).collect(),
+            num_rows: self.num_rows,
+        }
     }
     pub fn concat(schema: SchemaRef, batches: &[Batch]) -> Result<Batch> {
         let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();
         if schema.fields.is_empty() {
             // Zero-column batches carry only a row count; it must survive concatenation.
-            return Ok(Batch { schema, columns: vec![], num_rows: total_rows });
+            return Ok(Batch {
+                schema,
+                columns: vec![],
+                num_rows: total_rows,
+            });
         }
-        if batches.iter().any(|b| b.columns.is_empty() && b.num_rows > 0) {
-            return Err(EngineError::Plan("zero-column batch with rows cannot be concatenated into a schema with columns".into()));
+        if batches
+            .iter()
+            .any(|b| b.columns.is_empty() && b.num_rows > 0)
+        {
+            return Err(EngineError::Plan(
+                "zero-column batch with rows cannot be concatenated into a schema with columns"
+                    .into(),
+            ));
         }
         let non_empty: Vec<&Batch> = batches.iter().filter(|b| !b.columns.is_empty()).collect();
         if non_empty.is_empty() {
-            return Ok(Batch { schema: schema.clone(), columns: schema.fields.iter().map(|f| empty_col(f.data_type)).collect(), num_rows: 0 });
+            return Ok(Batch {
+                schema: schema.clone(),
+                columns: schema
+                    .fields
+                    .iter()
+                    .map(|f| empty_col(f.data_type))
+                    .collect(),
+                num_rows: 0,
+            });
         }
         let ncols = schema.fields.len();
         let mut cols = Vec::with_capacity(ncols);
@@ -326,15 +450,20 @@ impl Batch {
     }
     /// Approximate heap bytes, used by the memory budget.
     pub fn byte_size(&self) -> usize {
-        self.columns.iter().map(|c| {
-            let v = match &c.values {
-                Values::Bool(v) => v.len(),
-                Values::Int64(v) => v.len() * 8,
-                Values::Float64(v) => v.len() * 8,
-                Values::Utf8(s) => s.views.len() * 16 + s.buffers.iter().map(|b| b.len()).sum::<usize>(),
-            };
-            v + c.validity.as_ref().map_or(0, |m| m.len())
-        }).sum()
+        self.columns
+            .iter()
+            .map(|c| {
+                let v = match &c.values {
+                    Values::Bool(v) => v.len(),
+                    Values::Int64(v) => v.len() * 8,
+                    Values::Float64(v) => v.len() * 8,
+                    Values::Utf8(s) => {
+                        s.views.len() * 16 + s.buffers.iter().map(|b| b.len()).sum::<usize>()
+                    }
+                };
+                v + c.validity.as_ref().map_or(0, |m| m.len())
+            })
+            .sum()
     }
     pub fn row(&self, i: usize) -> Vec<ScalarValue> {
         self.columns.iter().map(|c| c.get(i)).collect()
@@ -366,17 +495,33 @@ mod tests {
         let a = Column::from_strs(&["hi", "a very long string over twelve bytes", ""]);
         let b = Column::from_strs(&["another long string past the inline limit"]);
         let c = Column::concat(&[&a.take(&[1, 0]), &b]).unwrap();
-        assert_eq!(c.get(0), ScalarValue::Utf8("a very long string over twelve bytes".into()));
+        assert_eq!(
+            c.get(0),
+            ScalarValue::Utf8("a very long string over twelve bytes".into())
+        );
         assert_eq!(c.get(1), ScalarValue::Utf8("hi".into()));
-        assert_eq!(c.get(2), ScalarValue::Utf8("another long string past the inline limit".into()));
+        assert_eq!(
+            c.get(2),
+            ScalarValue::Utf8("another long string past the inline limit".into())
+        );
     }
     #[test]
     fn many_buffers_keep_every_string_under_small_limit() {
         let strs: Vec<String> = (0..200)
-            .map(|i| if i % 5 == 0 { format!("s{i}") } else { format!("{i:0>width$}", width = 13 + i % 48) })
+            .map(|i| {
+                if i % 5 == 0 {
+                    format!("s{i}")
+                } else {
+                    format!("{i:0>width$}", width = 13 + i % 48)
+                }
+            })
             .collect();
         let sv = StringViews::from_strs_with_limit(&strs, 64);
-        assert!(sv.buffers.len() > 1, "expected several buffers, got {}", sv.buffers.len());
+        assert!(
+            sv.buffers.len() > 1,
+            "expected several buffers, got {}",
+            sv.buffers.len()
+        );
         for (i, s) in strs.iter().enumerate() {
             assert_eq!(sv.get(i), s.as_str(), "row {i}");
         }
@@ -386,11 +531,22 @@ mod tests {
     fn take_and_concat_round_trip_across_buffers() {
         let strs: Vec<String> = (0..50).map(|i| format!("row-{i:0>20}")).collect();
         let sv = StringViews::from_strs_with_limit(&strs, 64);
-        assert!(sv.buffers.len() > 1, "expected several buffers, got {}", sv.buffers.len());
-        let col = Column { values: Values::Utf8(sv), validity: None };
+        assert!(
+            sv.buffers.len() > 1,
+            "expected several buffers, got {}",
+            sv.buffers.len()
+        );
+        let col = Column {
+            values: Values::Utf8(sv),
+            validity: None,
+        };
         let idx: Vec<usize> = (0..50).rev().step_by(3).collect();
         let joined = Column::concat(&[&col.take(&idx), &col]).unwrap();
-        let expected: Vec<String> = idx.iter().map(|&i| strs[i].clone()).chain(strs.iter().cloned()).collect();
+        let expected: Vec<String> = idx
+            .iter()
+            .map(|&i| strs[i].clone())
+            .chain(strs.iter().cloned())
+            .collect();
         for (i, s) in expected.iter().enumerate() {
             assert_eq!(joined.get(i), ScalarValue::Utf8(s.clone()), "row {i}");
         }
@@ -405,8 +561,17 @@ mod tests {
     #[test]
     fn zero_column_batches_keep_their_row_count() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![]));
-        let b = Batch { schema: schema.clone(), columns: vec![], num_rows: 3 };
-        assert_eq!(Batch::concat(schema.clone(), &[b.clone(), b.clone()]).unwrap().num_rows, 6);
+        let b = Batch {
+            schema: schema.clone(),
+            columns: vec![],
+            num_rows: 3,
+        };
+        assert_eq!(
+            Batch::concat(schema.clone(), &[b.clone(), b.clone()])
+                .unwrap()
+                .num_rows,
+            6
+        );
         assert_eq!(b.take(&[0, 2]).num_rows, 2);
         assert_eq!(b.slice(1, 2).num_rows, 2);
     }

@@ -32,7 +32,8 @@ pub fn sort_batches(
     spill_dir: &Path,
     batch_rows: usize,
 ) -> Result<Vec<Batch>> {
-    sort_batches_with_stats(input, schema, order_by, budget, spill_dir, batch_rows).map(|(batches, _)| batches)
+    sort_batches_with_stats(input, schema, order_by, budget, spill_dir, batch_rows)
+        .map(|(batches, _)| batches)
 }
 
 /// Same as `sort_batches`, also reporting whether and how much was spilled.
@@ -59,7 +60,9 @@ pub fn sort_batches_with_stats(
             Ok((chunk_take(&merged, &order, batch_rows), stats))
         }
         Err(_) => {
-            let out = external_sort(input, schema, order_by, budget, spill_dir, batch_rows, &mut stats)?;
+            let out = external_sort(
+                input, schema, order_by, budget, spill_dir, batch_rows, &mut stats,
+            )?;
             Ok((out, stats))
         }
     }
@@ -76,7 +79,10 @@ fn external_sort(
 ) -> Result<Vec<Batch>> {
     // Pieces are processed in input order and bounded by batch_rows, so a run is a contiguous
     // input range and run index order is input order (the stability tie-break relies on this).
-    let mut pending: VecDeque<Batch> = input.into_iter().flat_map(|b| split_rows(b, batch_rows)).collect();
+    let mut pending: VecDeque<Batch> = input
+        .into_iter()
+        .flat_map(|b| split_rows(b, batch_rows))
+        .collect();
 
     let mut runs: Vec<SpillFile> = Vec::new();
     let mut run_buf: Vec<Batch> = Vec::new();
@@ -90,7 +96,13 @@ fn external_sort(
         if !run_buf.is_empty() {
             // Budget full: close this run, then retry the same piece on an empty run.
             pending.push_front(piece);
-            runs.push(spill_run(std::mem::take(&mut run_buf), &schema, order_by, spill_dir, batch_rows)?);
+            runs.push(spill_run(
+                std::mem::take(&mut run_buf),
+                &schema,
+                order_by,
+                spill_dir,
+                batch_rows,
+            )?);
             run_res = budget.try_reserve(0)?;
             continue;
         }
@@ -102,10 +114,15 @@ fn external_sort(
             pending.push_front(slice_compact(&piece, 0, half));
             continue;
         }
-        return Err(EngineError::Memory { requested: size, available: budget.available() });
+        return Err(EngineError::Memory {
+            requested: size,
+            available: budget.available(),
+        });
     }
     if !run_buf.is_empty() {
-        runs.push(spill_run(run_buf, &schema, order_by, spill_dir, batch_rows)?);
+        runs.push(spill_run(
+            run_buf, &schema, order_by, spill_dir, batch_rows,
+        )?);
     }
     drop(run_res);
 
@@ -148,7 +165,11 @@ fn slice_compact(batch: &Batch, start: usize, len: usize) -> Batch {
             Column { values, validity }
         })
         .collect();
-    Batch { schema: batch.schema.clone(), columns, num_rows: len }
+    Batch {
+        schema: batch.schema.clone(),
+        columns,
+        num_rows: len,
+    }
 }
 
 /// Sorts buffered pieces in memory and writes them to one spill file as `batch_rows` chunks.
@@ -246,10 +267,20 @@ fn heap_pop<F: Fn(usize, usize) -> bool>(heap: &mut Vec<usize>, less: F) -> Opti
 }
 
 /// K-way merge: holds one chunk per run, streams output in `batch_rows` batches.
-fn merge_runs(runs: &[SpillFile], schema: SchemaRef, order_by: &[SortField], batch_rows: usize) -> Result<Vec<Batch>> {
+fn merge_runs(
+    runs: &[SpillFile],
+    schema: SchemaRef,
+    order_by: &[SortField],
+    batch_rows: usize,
+) -> Result<Vec<Batch>> {
     let mut cursors: Vec<Cursor> = Vec::with_capacity(runs.len());
     for run in runs {
-        cursors.push(Cursor { reader: run.reader()?, chunk: None, keys: Vec::new(), pos: 0 });
+        cursors.push(Cursor {
+            reader: run.reader()?,
+            chunk: None,
+            keys: Vec::new(),
+            pos: 0,
+        });
     }
     let mut heap: Vec<usize> = Vec::with_capacity(cursors.len());
     for id in 0..cursors.len() {
@@ -261,7 +292,9 @@ fn merge_runs(runs: &[SpillFile], schema: SchemaRef, order_by: &[SortField], bat
     let mut out = OutBuilder::new(schema, batch_rows);
     while let Some(id) = heap_pop(&mut heap, |a, b| heap_less(&cursors, a, b, order_by)) {
         let cursor = &mut cursors[id];
-        let Some(chunk) = cursor.chunk.clone() else { continue };
+        let Some(chunk) = cursor.chunk.clone() else {
+            continue;
+        };
         out.push(Arc::clone(&chunk), cursor.pos)?;
         cursor.pos += 1;
         if cursor.pos < chunk.num_rows {
@@ -284,12 +317,20 @@ struct OutBuilder {
 
 impl OutBuilder {
     fn new(schema: SchemaRef, batch_rows: usize) -> Self {
-        OutBuilder { schema, batch_rows, pieces: Vec::new(), rows: 0, out: Vec::new() }
+        OutBuilder {
+            schema,
+            batch_rows,
+            pieces: Vec::new(),
+            rows: 0,
+            out: Vec::new(),
+        }
     }
 
     fn push(&mut self, src: Arc<Batch>, row: usize) -> Result<()> {
         match self.pieces.last_mut() {
-            Some((last, start, len)) if Arc::ptr_eq(last, &src) && *start + *len == row => *len += 1,
+            Some((last, start, len)) if Arc::ptr_eq(last, &src) && *start + *len == row => {
+                *len += 1
+            }
             _ => self.pieces.push((src, row, 1)),
         }
         self.rows += 1;
@@ -305,7 +346,11 @@ impl OutBuilder {
         }
         let columns = (0..self.schema.fields.len())
             .map(|j| {
-                let parts: Vec<Column> = self.pieces.iter().map(|(b, s, l)| b.columns[j].slice(*s, *l)).collect();
+                let parts: Vec<Column> = self
+                    .pieces
+                    .iter()
+                    .map(|(b, s, l)| b.columns[j].slice(*s, *l))
+                    .collect();
                 let refs: Vec<&Column> = parts.iter().collect();
                 Column::concat(&refs)
             })
@@ -332,21 +377,25 @@ fn sort_indices(batch: &Batch, order_by: &[SortField]) -> Result<Vec<usize>> {
 
 /// Splits `batch` into `batch_rows`-sized batches following the permutation.
 fn chunk_take(batch: &Batch, order: &[usize], batch_rows: usize) -> Vec<Batch> {
-    order.chunks(batch_rows).map(|idx| batch.take(idx)).collect()
+    order
+        .chunks(batch_rows)
+        .map(|idx| batch.take(idx))
+        .collect()
 }
 
 fn key_columns(batch: &Batch, order_by: &[SortField]) -> Result<Vec<Column>> {
-    order_by.iter().map(|f| key_column(&f.expr, batch)).collect()
+    order_by
+        .iter()
+        .map(|f| key_column(&f.expr, batch))
+        .collect()
 }
 
 /// Plain column refs are read directly; other expressions go through the evaluator.
 fn key_column(expr: &Expr, batch: &Batch) -> Result<Column> {
     match expr {
-        Expr::Column { index, .. } => batch
-            .columns
-            .get(*index)
-            .cloned()
-            .ok_or_else(|| EngineError::Plan(format!("sort key column index {index} out of range"))),
+        Expr::Column { index, .. } => batch.columns.get(*index).cloned().ok_or_else(|| {
+            EngineError::Plan(format!("sort key column index {index} out of range"))
+        }),
         other => eval(other, batch),
     }
 }
@@ -429,33 +478,62 @@ mod tests {
         let id = Column::from_i64(rows.iter().map(|r| r.id).collect());
         let k1 = Column::from_scalars(
             DataType::Int64,
-            &rows.iter().map(|r| r.k1.map_or(ScalarValue::Null(DataType::Int64), ScalarValue::Int64)).collect::<Vec<_>>(),
+            &rows
+                .iter()
+                .map(|r| {
+                    r.k1.map_or(ScalarValue::Null(DataType::Int64), ScalarValue::Int64)
+                })
+                .collect::<Vec<_>>(),
         )
         .unwrap();
         let k2 = Column::from_scalars(
             DataType::Utf8,
-            &rows.iter().map(|r| r.k2.clone().map_or(ScalarValue::Null(DataType::Utf8), ScalarValue::Utf8)).collect::<Vec<_>>(),
+            &rows
+                .iter()
+                .map(|r| {
+                    r.k2.clone()
+                        .map_or(ScalarValue::Null(DataType::Utf8), ScalarValue::Utf8)
+                })
+                .collect::<Vec<_>>(),
         )
         .unwrap();
         let k3 = Column::from_scalars(
             DataType::Float64,
-            &rows.iter().map(|r| r.k3.map_or(ScalarValue::Null(DataType::Float64), ScalarValue::Float64)).collect::<Vec<_>>(),
+            &rows
+                .iter()
+                .map(|r| {
+                    r.k3.map_or(ScalarValue::Null(DataType::Float64), ScalarValue::Float64)
+                })
+                .collect::<Vec<_>>(),
         )
         .unwrap();
         Batch::try_new(schema(), vec![id, k1, k2, k3]).unwrap()
     }
 
     fn row(id: i64, k1: Option<i64>, k2: Option<&str>, k3: Option<f64>) -> Row {
-        Row { id, k1, k2: k2.map(str::to_string), k3 }
+        Row {
+            id,
+            k1,
+            k2: k2.map(str::to_string),
+            k3,
+        }
     }
 
     fn key(index: usize) -> Expr {
         let dt = schema().fields[index].data_type;
-        Expr::Column { name: schema().fields[index].name.clone(), index, data_type: dt }
+        Expr::Column {
+            name: schema().fields[index].name.clone(),
+            index,
+            data_type: dt,
+        }
     }
 
     fn sf(index: usize, ascending: bool, nulls_first: bool) -> SortField {
-        SortField { expr: key(index), ascending, nulls_first }
+        SortField {
+            expr: key(index),
+            ascending,
+            nulls_first,
+        }
     }
 
     fn ids(batches: &[Batch]) -> Vec<i64> {
@@ -481,17 +559,45 @@ mod tests {
     #[test]
     fn zero_column_batch_keeps_row_count_through_sort() {
         let zero_cols: SchemaRef = Arc::new(Schema::new(vec![]));
-        let b = Batch { schema: zero_cols.clone(), columns: vec![], num_rows: 3 };
-        let out = sort_batches(vec![b], zero_cols, &[], &big_budget(), &spill_dir("zero_col"), 10).unwrap();
+        let b = Batch {
+            schema: zero_cols.clone(),
+            columns: vec![],
+            num_rows: 3,
+        };
+        let out = sort_batches(
+            vec![b],
+            zero_cols,
+            &[],
+            &big_budget(),
+            &spill_dir("zero_col"),
+            10,
+        )
+        .unwrap();
         assert_eq!(out.iter().map(|b| b.num_rows).sum::<usize>(), 3);
     }
 
     #[test]
     fn empty_input_yields_no_batches() {
         let dir = spill_dir("empty");
-        let out = sort_batches(vec![], schema(), &[sf(0, true, true)], &big_budget(), &dir, 10).unwrap();
+        let out = sort_batches(
+            vec![],
+            schema(),
+            &[sf(0, true, true)],
+            &big_budget(),
+            &dir,
+            10,
+        )
+        .unwrap();
         assert!(out.is_empty());
-        let out = sort_batches(vec![Batch::empty(schema())], schema(), &[sf(0, true, true)], &big_budget(), &dir, 10).unwrap();
+        let out = sort_batches(
+            vec![Batch::empty(schema())],
+            schema(),
+            &[sf(0, true, true)],
+            &big_budget(),
+            &dir,
+            10,
+        )
+        .unwrap();
         assert!(out.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -526,14 +632,51 @@ mod tests {
     #[test]
     fn nulls_first_and_last_are_independent_of_direction() {
         let dir = spill_dir("nulls");
-        let rows = [row(0, None, None, None), row(1, Some(5), None, None), row(2, Some(3), None, None), row(3, None, None, None)];
-        let asc_last = sort_batches(vec![build(&rows)], schema(), &[sf(1, true, false)], &big_budget(), &dir, 100).unwrap();
+        let rows = [
+            row(0, None, None, None),
+            row(1, Some(5), None, None),
+            row(2, Some(3), None, None),
+            row(3, None, None, None),
+        ];
+        let asc_last = sort_batches(
+            vec![build(&rows)],
+            schema(),
+            &[sf(1, true, false)],
+            &big_budget(),
+            &dir,
+            100,
+        )
+        .unwrap();
         assert_eq!(ids(&asc_last), vec![2, 1, 0, 3]);
-        let asc_first = sort_batches(vec![build(&rows)], schema(), &[sf(1, true, true)], &big_budget(), &dir, 100).unwrap();
+        let asc_first = sort_batches(
+            vec![build(&rows)],
+            schema(),
+            &[sf(1, true, true)],
+            &big_budget(),
+            &dir,
+            100,
+        )
+        .unwrap();
         assert_eq!(ids(&asc_first), vec![0, 3, 2, 1]);
-        let desc_first = sort_batches(vec![build(&rows)], schema(), &[sf(1, false, true)], &big_budget(), &dir, 100).unwrap();
+        let desc_first = sort_batches(
+            vec![build(&rows)],
+            schema(),
+            &[sf(1, false, true)],
+            &big_budget(),
+            &dir,
+            100,
+        )
+        .unwrap();
         assert_eq!(ids(&desc_first), vec![0, 3, 1, 2]);
-        let desc_last = sort_batches(vec![build(&rows)], schema(), &[sf(1, false, false)], &big_budget(), &dir, 100).unwrap();
+        let desc_last = sort_batches(
+            vec![build(&rows)],
+            schema(),
+            &[sf(1, false, false)],
+            &big_budget(),
+            &dir,
+            100,
+        )
+        .unwrap();
         assert_eq!(ids(&desc_last), vec![1, 2, 0, 3]);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -543,9 +686,20 @@ mod tests {
         let dir = spill_dir("stable");
         let a = build(&[row(0, Some(1), None, None), row(1, Some(0), None, None)]);
         let b = build(&[row(2, Some(1), None, None), row(3, Some(0), None, None)]);
-        let out = sort_batches(vec![a, b], schema(), &[sf(1, true, true)], &big_budget(), &dir, 3).unwrap();
+        let out = sort_batches(
+            vec![a, b],
+            schema(),
+            &[sf(1, true, true)],
+            &big_budget(),
+            &dir,
+            3,
+        )
+        .unwrap();
         assert_eq!(ids(&out), vec![1, 3, 0, 2]);
-        assert_eq!(out.iter().map(|b| b.num_rows).collect::<Vec<_>>(), vec![3, 1]);
+        assert_eq!(
+            out.iter().map(|b| b.num_rows).collect::<Vec<_>>(),
+            vec![3, 1]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -558,9 +712,25 @@ mod tests {
             row(2, None, Some("ab"), Some(-0.0)),
             row(3, None, Some("é"), Some(f64::NEG_INFINITY)),
         ];
-        let by_float = sort_batches(vec![build(&rows)], schema(), &[sf(3, true, true)], &big_budget(), &dir, 10).unwrap();
+        let by_float = sort_batches(
+            vec![build(&rows)],
+            schema(),
+            &[sf(3, true, true)],
+            &big_budget(),
+            &dir,
+            10,
+        )
+        .unwrap();
         assert_eq!(ids(&by_float), vec![3, 2, 1, 0]);
-        let by_str = sort_batches(vec![build(&rows)], schema(), &[sf(2, true, true)], &big_budget(), &dir, 10).unwrap();
+        let by_str = sort_batches(
+            vec![build(&rows)],
+            schema(),
+            &[sf(2, true, true)],
+            &big_budget(),
+            &dir,
+            10,
+        )
+        .unwrap();
         assert_eq!(ids(&by_str), vec![1, 2, 0, 3]);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -569,7 +739,15 @@ mod tests {
     fn output_batches_respect_batch_rows_and_keep_every_row() {
         let dir = spill_dir("chunks");
         let rows: Vec<Row> = (0..25).map(|i| row(i, Some(25 - i), None, None)).collect();
-        let out = sort_batches(vec![build(&rows)], schema(), &[sf(1, true, true)], &big_budget(), &dir, 7).unwrap();
+        let out = sort_batches(
+            vec![build(&rows)],
+            schema(),
+            &[sf(1, true, true)],
+            &big_budget(),
+            &dir,
+            7,
+        )
+        .unwrap();
         assert!(out.iter().all(|b| b.num_rows <= 7));
         assert_eq!(out.iter().map(|b| b.num_rows).sum::<usize>(), 25);
         assert_eq!(ids(&out)[0], 24);
@@ -580,7 +758,11 @@ mod tests {
     fn non_column_key_result_matches_the_evaluator_exactly() {
         let dir = spill_dir("expr");
         let expr = Expr::Literal(ScalarValue::Int64(1));
-        let order = [SortField { expr: expr.clone(), ascending: true, nulls_first: true }];
+        let order = [SortField {
+            expr: expr.clone(),
+            ascending: true,
+            nulls_first: true,
+        }];
         let batch = build(&[row(0, Some(1), None, None), row(1, Some(2), None, None)]);
         // Sort must not swallow or rewrite the evaluator's outcome, whatever it currently is.
         let expected = eval(&expr, &batch).map(|_| ());
@@ -593,7 +775,11 @@ mod tests {
     fn key_index_out_of_range_is_a_plan_error() {
         let dir = spill_dir("oob");
         let bad = SortField {
-            expr: Expr::Column { name: "nope".into(), index: 9, data_type: DataType::Int64 },
+            expr: Expr::Column {
+                name: "nope".into(),
+                index: 9,
+                data_type: DataType::Int64,
+            },
             ascending: true,
             nulls_first: true,
         };
@@ -608,8 +794,13 @@ mod tests {
         let dir = spill_dir("reserve");
         let budget = MemoryBudget::new(1 << 30);
         let child = budget.child(1 << 29);
-        let input = vec![build(&[row(0, Some(3), None, None), row(1, Some(1), None, None)])];
-        let (_, stats) = sort_batches_with_stats(input, schema(), &[sf(1, true, true)], &child, &dir, 10).unwrap();
+        let input = vec![build(&[
+            row(0, Some(3), None, None),
+            row(1, Some(1), None, None),
+        ])];
+        let (_, stats) =
+            sort_batches_with_stats(input, schema(), &[sf(1, true, true)], &child, &dir, 10)
+                .unwrap();
         assert_eq!(stats.runs_spilled, 0);
         assert_eq!((child.used(), budget.used()), (0, 0));
         fs::remove_dir_all(&dir).unwrap();
@@ -617,14 +808,28 @@ mod tests {
 
     fn random_rows(rng: &mut StdRng, n: i64) -> Vec<Row> {
         const STRS: &[&str] = &[
-            "", "a", "exactly12byt", "exactly123ch", "a string well over twelve bytes long", "ümlaut-long-string-é", "zz",
+            "",
+            "a",
+            "exactly12byt",
+            "exactly123ch",
+            "a string well over twelve bytes long",
+            "ümlaut-long-string-é",
+            "zz",
         ];
         const FLOATS: &[f64] = &[f64::NAN, -0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY, 1.5];
         (0..n)
             .map(|id| Row {
                 id,
-                k1: if rng.gen_bool(0.1) { None } else { Some(rng.gen_range(0..20)) },
-                k2: if rng.gen_bool(0.1) { None } else { Some(STRS[rng.gen_range(0..STRS.len())].to_string()) },
+                k1: if rng.gen_bool(0.1) {
+                    None
+                } else {
+                    Some(rng.gen_range(0..20))
+                },
+                k2: if rng.gen_bool(0.1) {
+                    None
+                } else {
+                    Some(STRS[rng.gen_range(0..STRS.len())].to_string())
+                },
                 k3: if rng.gen_bool(0.1) {
                     None
                 } else if rng.gen_bool(0.5) {
@@ -645,14 +850,23 @@ mod tests {
         let order = [sf(1, true, true), sf(2, false, false), sf(3, true, false)];
 
         let (reference, ref_stats) =
-            sort_batches_with_stats(input.clone(), schema(), &order, &big_budget(), &dir, 512).unwrap();
+            sort_batches_with_stats(input.clone(), schema(), &order, &big_budget(), &dir, 512)
+                .unwrap();
         assert_eq!(ref_stats.runs_spilled, 0);
 
         let tiny = MemoryBudget::new(64 * 1024);
-        let (external, stats) = sort_batches_with_stats(input, schema(), &order, &tiny, &dir, 512).unwrap();
-        assert!(stats.runs_spilled >= 2, "expected spilled runs, got {}", stats.runs_spilled);
+        let (external, stats) =
+            sort_batches_with_stats(input, schema(), &order, &tiny, &dir, 512).unwrap();
+        assert!(
+            stats.runs_spilled >= 2,
+            "expected spilled runs, got {}",
+            stats.runs_spilled
+        );
         assert_eq!(stats.spill_paths.len(), stats.runs_spilled);
-        assert!(stats.spill_paths.iter().all(|p| !p.exists()), "spill files must be deleted after the sort");
+        assert!(
+            stats.spill_paths.iter().all(|p| !p.exists()),
+            "spill files must be deleted after the sort"
+        );
         assert_eq!(tiny.used(), 0);
 
         assert_eq!(ids(&external), ids(&reference));
@@ -666,18 +880,24 @@ mod tests {
     fn external_sort_is_stable_under_heavy_duplication() {
         let dir = spill_dir("dupes");
         let mut rng = StdRng::seed_from_u64(9);
-        let rows: Vec<Row> = (0..5_000).map(|id| row(id, Some(rng.gen_range(0..3)), None, None)).collect();
+        let rows: Vec<Row> = (0..5_000)
+            .map(|id| row(id, Some(rng.gen_range(0..3)), None, None))
+            .collect();
         let input: Vec<Batch> = rows.chunks(250).map(build).collect();
         let order = [sf(1, true, true)];
         let tiny = MemoryBudget::new(16 * 1024);
-        let (out, stats) = sort_batches_with_stats(input, schema(), &order, &tiny, &dir, 128).unwrap();
+        let (out, stats) =
+            sort_batches_with_stats(input, schema(), &order, &tiny, &dir, 128).unwrap();
         assert!(stats.runs_spilled > 1);
         // Within each key value the original id order must survive the merge.
         let got = ids(&out);
         let mut last_by_key: [i64; 3] = [-1; 3];
         for (pos, id) in got.iter().enumerate() {
             let k = rows[*id as usize].k1.unwrap_or(0) as usize;
-            assert!(*id > last_by_key[k], "stability broken at output position {pos}");
+            assert!(
+                *id > last_by_key[k],
+                "stability broken at output position {pos}"
+            );
             last_by_key[k] = *id;
         }
         fs::remove_dir_all(&dir).unwrap();
@@ -697,11 +917,19 @@ mod tests {
             })
             .collect();
         let order = [sf(1, true, true), sf(2, true, true)];
-        let (reference, _) =
-            sort_batches_with_stats(vec![build(&rows)], schema(), &order, &big_budget(), &dir, 256).unwrap();
+        let (reference, _) = sort_batches_with_stats(
+            vec![build(&rows)],
+            schema(),
+            &order,
+            &big_budget(),
+            &dir,
+            256,
+        )
+        .unwrap();
         let tiny = MemoryBudget::new(64 * 1024);
         let (external, stats) =
-            sort_batches_with_stats(vec![build(&rows)], schema(), &order, &tiny, &dir, 256).unwrap();
+            sort_batches_with_stats(vec![build(&rows)], schema(), &order, &tiny, &dir, 256)
+                .unwrap();
         assert!(stats.runs_spilled >= 2);
         assert_eq!(canonical_rows(&external), canonical_rows(&reference));
         fs::remove_dir_all(&dir).unwrap();
@@ -710,9 +938,22 @@ mod tests {
     #[test]
     fn oversized_single_row_under_budget_is_a_memory_error() {
         let dir = spill_dir("oom");
-        let big = Row { id: 0, k1: Some(1), k2: Some("x".repeat(10_000)), k3: None };
+        let big = Row {
+            id: 0,
+            k1: Some(1),
+            k2: Some("x".repeat(10_000)),
+            k3: None,
+        };
         let tiny = MemoryBudget::new(64);
-        let err = sort_batches(vec![build(&[big])], schema(), &[sf(1, true, true)], &tiny, &dir, 4).unwrap_err();
+        let err = sort_batches(
+            vec![build(&[big])],
+            schema(),
+            &[sf(1, true, true)],
+            &tiny,
+            &dir,
+            4,
+        )
+        .unwrap_err();
         assert!(matches!(err, EngineError::Memory { .. }));
         assert_eq!(tiny.used(), 0);
         fs::remove_dir_all(&dir).unwrap();

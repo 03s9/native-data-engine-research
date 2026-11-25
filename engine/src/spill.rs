@@ -127,7 +127,10 @@ impl SpillFile {
         if &magic != MAGIC {
             return Err(corrupt("bad magic"));
         }
-        Ok(SpillReader { input, schema: self.schema.clone() })
+        Ok(SpillReader {
+            input,
+            schema: self.schema.clone(),
+        })
     }
 
     /// Read all batches back in write order.
@@ -168,11 +171,16 @@ impl SpillReader {
 
 fn validate(schema: &SchemaRef, batch: &Batch) -> Result<()> {
     if batch.columns.len() != schema.fields.len() {
-        return Err(EngineError::Type("spill batch column count mismatch".into()));
+        return Err(EngineError::Type(
+            "spill batch column count mismatch".into(),
+        ));
     }
     for (field, col) in schema.fields.iter().zip(&batch.columns) {
         if col.data_type() != field.data_type || col.len() != batch.num_rows {
-            return Err(EngineError::Type(format!("spill column '{}' type/length mismatch", field.name)));
+            return Err(EngineError::Type(format!(
+                "spill column '{}' type/length mismatch",
+                field.name
+            )));
         }
     }
     Ok(())
@@ -201,7 +209,8 @@ fn encode_column(col: &Column, n: usize, buf: &mut Vec<u8>) -> Result<()> {
         Values::Utf8(sv) => {
             for i in 0..n {
                 let s = sv.get(i).as_bytes();
-                let len = u32::try_from(s.len()).map_err(|_| EngineError::Io("string exceeds u32 length".into()))?;
+                let len = u32::try_from(s.len())
+                    .map_err(|_| EngineError::Io("string exceeds u32 length".into()))?;
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(s);
             }
@@ -260,11 +269,19 @@ fn decode_column(r: &mut impl Read, dt: DataType, n: usize) -> Result<Column> {
         DataType::Boolean => Values::Bool(read_bools(r, n)?),
         DataType::Int64 => {
             let raw = read_vec(r, n.checked_mul(8).ok_or_else(|| corrupt("row count"))?)?;
-            Values::Int64((0..n).map(|i| i64::from_le_bytes(le8(&raw[i * 8..(i + 1) * 8]))).collect())
+            Values::Int64(
+                (0..n)
+                    .map(|i| i64::from_le_bytes(le8(&raw[i * 8..(i + 1) * 8])))
+                    .collect(),
+            )
         }
         DataType::Float64 => {
             let raw = read_vec(r, n.checked_mul(8).ok_or_else(|| corrupt("row count"))?)?;
-            Values::Float64((0..n).map(|i| f64::from_bits(u64::from_le_bytes(le8(&raw[i * 8..(i + 1) * 8])))).collect())
+            Values::Float64(
+                (0..n)
+                    .map(|i| f64::from_bits(u64::from_le_bytes(le8(&raw[i * 8..(i + 1) * 8]))))
+                    .collect(),
+            )
         }
         DataType::Utf8 => {
             let mut strings = Vec::with_capacity(n);
@@ -306,7 +323,15 @@ pub(crate) mod test_support {
     pub(crate) fn canonical_rows(batches: &[Batch]) -> Vec<String> {
         batches
             .iter()
-            .flat_map(|b| (0..b.num_rows).map(move |i| b.columns.iter().map(|c| cell(c, i)).collect::<Vec<_>>().join("|")))
+            .flat_map(|b| {
+                (0..b.num_rows).map(move |i| {
+                    b.columns
+                        .iter()
+                        .map(|c| cell(c, i))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+            })
             .collect()
     }
 }
@@ -349,13 +374,22 @@ mod tests {
 
     fn random_string(rng: &mut StdRng) -> String {
         const POOL: &[&str] = &[
-            "", "a", "exactly12byt", "exactly123ch", "thirteen-byte", "a string well over twelve bytes long",
-            "ümlaut-ünicode-long-string-é", "日本語のテキスト長い文字列", "zz",
+            "",
+            "a",
+            "exactly12byt",
+            "exactly123ch",
+            "thirteen-byte",
+            "a string well over twelve bytes long",
+            "ümlaut-ünicode-long-string-é",
+            "日本語のテキスト長い文字列",
+            "zz",
         ];
         if rng.gen_bool(0.5) {
             POOL[rng.gen_range(0..POOL.len())].to_string()
         } else {
-            (0..rng.gen_range(0..40)).map(|_| char::from(rng.gen_range(b'a'..=b'z'))).collect()
+            (0..rng.gen_range(0..40))
+                .map(|_| char::from(rng.gen_range(b'a'..=b'z')))
+                .collect()
         }
     }
 
@@ -373,10 +407,22 @@ mod tests {
             .collect();
         let strings: Vec<String> = (0..n).map(|_| random_string(rng)).collect();
         let cols = vec![
-            Column { values: Values::Bool(bools), validity: opt_validity(rng, n) },
-            Column { values: Values::Int64(ints), validity: opt_validity(rng, n) },
-            Column { values: Values::Float64(floats), validity: opt_validity(rng, n) },
-            Column { values: Values::Utf8(StringViews::from_strs(&strings)), validity: opt_validity(rng, n) },
+            Column {
+                values: Values::Bool(bools),
+                validity: opt_validity(rng, n),
+            },
+            Column {
+                values: Values::Int64(ints),
+                validity: opt_validity(rng, n),
+            },
+            Column {
+                values: Values::Float64(floats),
+                validity: opt_validity(rng, n),
+            },
+            Column {
+                values: Values::Utf8(StringViews::from_strs(&strings)),
+                validity: opt_validity(rng, n),
+            },
         ];
         Batch::try_new(schema.clone(), cols).unwrap()
     }
@@ -396,7 +442,10 @@ mod tests {
         let dir = test_dir("rt");
         let schema = all_types_schema();
         let mut rng = StdRng::seed_from_u64(7);
-        let batches: Vec<Batch> = [1usize, 17, 500, 0, 3].iter().map(|&n| random_batch(&mut rng, &schema, n)).collect();
+        let batches: Vec<Batch> = [1usize, 17, 500, 0, 3]
+            .iter()
+            .map(|&n| random_batch(&mut rng, &schema, n))
+            .collect();
         let (file, back) = roundtrip(&dir, &schema, &batches);
         assert_eq!(back.len(), batches.len());
         assert_eq!(canonical_rows(&back), canonical_rows(&batches));
@@ -434,7 +483,9 @@ mod tests {
         ];
         let b = Batch::try_new(schema.clone(), vec![Column::from_f64(payloads.to_vec())]).unwrap();
         let (_f, back) = roundtrip(&dir, &schema, &[b]);
-        let Values::Float64(got) = &back[0].columns[0].values else { panic!("expected f64") };
+        let Values::Float64(got) = &back[0].columns[0].values else {
+            panic!("expected f64")
+        };
         for (x, y) in payloads.iter().zip(got) {
             assert_eq!(x.to_bits(), y.to_bits());
         }
@@ -445,11 +496,21 @@ mod tests {
     fn long_and_boundary_strings_roundtrip() {
         let dir = test_dir("str");
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
-        let items = ["", "12345678901", "123456789012", "1234567890123", &"x".repeat(100_000), "é日本"];
+        let items = [
+            "",
+            "12345678901",
+            "123456789012",
+            "1234567890123",
+            &"x".repeat(100_000),
+            "é日本",
+        ];
         let b = Batch::try_new(schema.clone(), vec![Column::from_strs(&items)]).unwrap();
         let (_f, back) = roundtrip(&dir, &schema, &[b]);
         for (i, s) in items.iter().enumerate() {
-            assert_eq!(back[0].columns[0].get(i), crate::types::ScalarValue::Utf8((*s).to_string()));
+            assert_eq!(
+                back[0].columns[0].get(i),
+                crate::types::ScalarValue::Utf8((*s).to_string())
+            );
         }
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -460,7 +521,11 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
         let mut w = SpillWriter::create(&dir, schema.clone()).unwrap();
         for start in [0i64, 10, 20] {
-            let b = Batch::try_new(schema.clone(), vec![Column::from_i64((start..start + 10).collect())]).unwrap();
+            let b = Batch::try_new(
+                schema.clone(),
+                vec![Column::from_i64((start..start + 10).collect())],
+            )
+            .unwrap();
             w.write(&b).unwrap();
         }
         let file = w.finish().unwrap();
@@ -510,8 +575,14 @@ mod tests {
     fn filenames_are_unique_within_a_directory() {
         let dir = test_dir("names");
         let schema = all_types_schema();
-        let a = SpillWriter::create(&dir, schema.clone()).unwrap().finish().unwrap();
-        let b = SpillWriter::create(&dir, schema.clone()).unwrap().finish().unwrap();
+        let a = SpillWriter::create(&dir, schema.clone())
+            .unwrap()
+            .finish()
+            .unwrap();
+        let b = SpillWriter::create(&dir, schema.clone())
+            .unwrap()
+            .finish()
+            .unwrap();
         assert_ne!(a.path(), b.path());
         assert_eq!(a.num_rows(), 0);
         assert!(a.read().unwrap().is_empty());

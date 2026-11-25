@@ -41,7 +41,11 @@ pub struct Field {
 
 impl Field {
     pub fn new(name: &str, data_type: DataType, nullable: bool) -> Self {
-        Field { name: name.to_string(), data_type, nullable }
+        Field {
+            name: name.to_string(),
+            data_type,
+            nullable,
+        }
     }
 }
 

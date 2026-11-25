@@ -5,12 +5,22 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Default)]
-pub struct Catalog { pub tables: HashMap<String, (SchemaRef, Vec<Batch>)> }
+pub struct Catalog {
+    pub tables: HashMap<String, (SchemaRef, Vec<Batch>)>,
+}
 
 impl Catalog {
-    pub fn new() -> Self { Self::default() }
-    pub fn register(&mut self, name: &str, schema: SchemaRef, batches: Vec<Batch>) { self.tables.insert(name.to_string(), (schema, batches)); }
-    pub fn get(&self, name: &str) -> Result<&(SchemaRef, Vec<Batch>)> { self.tables.get(name).ok_or_else(|| EngineError::Plan(format!("table '{name}' not found"))) }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn register(&mut self, name: &str, schema: SchemaRef, batches: Vec<Batch>) {
+        self.tables.insert(name.to_string(), (schema, batches));
+    }
+    pub fn get(&self, name: &str) -> Result<&(SchemaRef, Vec<Batch>)> {
+        self.tables
+            .get(name)
+            .ok_or_else(|| EngineError::Plan(format!("table '{name}' not found")))
+    }
 }
 
 /// CSV with header row; column types inferred (Int64 > Float64 > Boolean > Utf8) over ALL rows; empty field => NULL.
@@ -18,14 +28,18 @@ impl Catalog {
 /// Blank lines are skipped. A row whose field count differs from the header is an `EngineError::Io` naming the line.
 /// A column is nullable iff it contains at least one empty field. Batches of `batch_rows` rows (zero data rows => no batches).
 pub fn load_csv(path: &Path, batch_rows: usize) -> Result<(SchemaRef, Vec<Batch>)> {
-    let text = std::fs::read_to_string(path).map_err(|e| EngineError::Io(format!("{}: {e}", path.display())))?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| EngineError::Io(format!("{}: {e}", path.display())))?;
     parse_table(&text, batch_rows).map_err(|e| match e {
         EngineError::Io(m) => EngineError::Io(format!("{}: {m}", path.display())),
         other => other,
     })
 }
 
-struct Record { line: usize, fields: Vec<String> }
+struct Record {
+    line: usize,
+    fields: Vec<String>,
+}
 
 fn parse_table(text: &str, batch_rows: usize) -> Result<(SchemaRef, Vec<Batch>)> {
     if batch_rows == 0 {
@@ -34,18 +48,26 @@ fn parse_table(text: &str, batch_rows: usize) -> Result<(SchemaRef, Vec<Batch>)>
     // Excel and other editors write a UTF-8 byte order mark; it is not part of the first header name.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut records = parse_csv(text)?.into_iter();
-    let header = records.next().ok_or_else(|| EngineError::Io("missing header row".into()))?;
+    let header = records
+        .next()
+        .ok_or_else(|| EngineError::Io("missing header row".into()))?;
     let ncols = header.fields.len();
     let rows: Vec<Record> = records.collect();
     for r in &rows {
         if r.fields.len() != ncols {
-            return Err(EngineError::Io(format!("line {}: expected {ncols} fields, found {}", r.line, r.fields.len())));
+            return Err(EngineError::Io(format!(
+                "line {}: expected {ncols} fields, found {}",
+                r.line,
+                r.fields.len()
+            )));
         }
     }
     let mut seen = HashSet::new();
     for name in &header.fields {
         if !seen.insert(name.as_str()) {
-            return Err(EngineError::Io(format!("line 1: duplicate column name '{name}'")));
+            return Err(EngineError::Io(format!(
+                "line 1: duplicate column name '{name}'"
+            )));
         }
     }
 
@@ -54,7 +76,8 @@ fn parse_table(text: &str, batch_rows: usize) -> Result<(SchemaRef, Vec<Batch>)>
         .iter()
         .enumerate()
         .map(|(j, name)| {
-            let (mut all_int, mut all_float, mut all_bool, mut any_value, mut any_null) = (true, true, true, false, false);
+            let (mut all_int, mut all_float, mut all_bool, mut any_value, mut any_null) =
+                (true, true, true, false, false);
             for r in &rows {
                 let v = r.fields[j].as_str();
                 if v.is_empty() {
@@ -66,7 +89,8 @@ fn parse_table(text: &str, batch_rows: usize) -> Result<(SchemaRef, Vec<Batch>)>
                 // An integer literal outside i64 must not become Float64 (that loses precision): it makes the column text.
                 let overflowing_int = is_integer_literal(v) && v.parse::<i64>().is_err();
                 all_float = all_float && !overflowing_int && is_float_literal(v);
-                all_bool = all_bool && (v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false"));
+                all_bool =
+                    all_bool && (v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false"));
             }
             let dt = if !any_value {
                 DataType::Utf8
@@ -103,9 +127,24 @@ fn parse_table(text: &str, batch_rows: usize) -> Result<(SchemaRef, Vec<Batch>)>
 /// Cells are raw field text; an empty cell is NULL.
 fn build_column(dt: DataType, cells: &[&str]) -> Column {
     let col = match dt {
-        DataType::Int64 => Column::from_i64(cells.iter().map(|c| c.parse::<i64>().unwrap_or(0)).collect()),
-        DataType::Float64 => Column::from_f64(cells.iter().map(|c| c.parse::<f64>().unwrap_or(0.0)).collect()),
-        DataType::Boolean => Column::from_bool(cells.iter().map(|c| c.eq_ignore_ascii_case("true")).collect()),
+        DataType::Int64 => Column::from_i64(
+            cells
+                .iter()
+                .map(|c| c.parse::<i64>().unwrap_or(0))
+                .collect(),
+        ),
+        DataType::Float64 => Column::from_f64(
+            cells
+                .iter()
+                .map(|c| c.parse::<f64>().unwrap_or(0.0))
+                .collect(),
+        ),
+        DataType::Boolean => Column::from_bool(
+            cells
+                .iter()
+                .map(|c| c.eq_ignore_ascii_case("true"))
+                .collect(),
+        ),
         DataType::Utf8 => Column::from_strs(cells),
     };
     let validity: Vec<bool> = cells.iter().map(|c| !c.is_empty()).collect();
@@ -233,7 +272,10 @@ fn parse_csv(text: &str) -> Result<Vec<Record>> {
         }
         let blank = fields.len() == 1 && fields[0].is_empty() && !any_quoted;
         if !blank {
-            records.push(Record { line: start_line, fields });
+            records.push(Record {
+                line: start_line,
+                fields,
+            });
         }
     }
     Ok(records)
@@ -249,7 +291,10 @@ mod tests {
     }
 
     fn cells(batches: &[Batch]) -> Vec<ScalarValue> {
-        batches.iter().flat_map(|b| (0..b.num_rows).map(move |i| b.row(i)[0].clone())).collect()
+        batches
+            .iter()
+            .flat_map(|b| (0..b.num_rows).map(move |i| b.row(i)[0].clone()))
+            .collect()
     }
 
     #[test]
@@ -267,7 +312,10 @@ mod tests {
         assert_eq!(sch.fields[0].data_type, DataType::Utf8);
         assert_eq!(
             cells(&b),
-            vec![ScalarValue::Utf8("1".into()), ScalarValue::Utf8("9223372036854775808".into())]
+            vec![
+                ScalarValue::Utf8("1".into()),
+                ScalarValue::Utf8("9223372036854775808".into())
+            ]
         );
 
         let (neg, _) = table("n\n-9223372036854775809\n2.5\n");
@@ -278,7 +326,10 @@ mod tests {
     fn i64_boundary_values_still_infer_int64() {
         let (sch, b) = table("n\n-9223372036854775808\n9223372036854775807\n");
         assert_eq!(sch.fields[0].data_type, DataType::Int64);
-        assert_eq!(cells(&b), vec![ScalarValue::Int64(i64::MIN), ScalarValue::Int64(i64::MAX)]);
+        assert_eq!(
+            cells(&b),
+            vec![ScalarValue::Int64(i64::MIN), ScalarValue::Int64(i64::MAX)]
+        );
     }
 
     #[test]

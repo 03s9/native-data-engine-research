@@ -28,7 +28,9 @@ pub fn split_morsels(batch: &Batch, morsel_rows: usize) -> Vec<Batch> {
 /// The first error (in time) aborts remaining work: morsels not yet started are skipped and that error is returned.
 /// Panics in `op` become `EngineError::Io("worker panic")`. `threads == 0` is clamped to 1.
 pub fn run_morsels<F>(morsels: Vec<Batch>, threads: usize, op: F) -> Result<Vec<Batch>>
-where F: Fn(&Batch) -> Result<Batch> + Send + Sync {
+where
+    F: Fn(&Batch) -> Result<Batch> + Send + Sync,
+{
     if morsels.is_empty() {
         return Ok(vec![]);
     }
@@ -118,7 +120,7 @@ impl BridgeReceiver {
 mod tests {
     use super::*;
     use crate::column::{schema_ref, Column};
-    use crate::types::{DataType, Field, Schema, ScalarValue};
+    use crate::types::{DataType, Field, ScalarValue, Schema};
     use std::sync::atomic::{AtomicUsize, Ordering as AO};
     use std::sync::mpsc as std_mpsc;
     use std::sync::Arc;
@@ -146,11 +148,15 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
-        rx.recv_timeout(WATCHDOG).expect("watchdog: operation did not finish (deadlock?)")
+        rx.recv_timeout(WATCHDOG)
+            .expect("watchdog: operation did not finish (deadlock?)")
     }
 
     fn current_thread_rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -243,8 +249,15 @@ mod tests {
         // consumer stalled: producer must stop at credits (queued) and cannot exceed credits + 1
         std::thread::sleep(Duration::from_millis(300));
         let stalled = sent.load(AO::SeqCst);
-        assert!(stalled >= credits, "producer should have filled the credits, got {stalled}");
-        assert!(stalled <= credits + 1, "producer ran ahead: {stalled} > {}", credits + 1);
+        assert!(
+            stalled >= credits,
+            "producer should have filled the credits, got {stalled}"
+        );
+        assert!(
+            stalled <= credits + 1,
+            "producer ran ahead: {stalled} > {}",
+            credits + 1
+        );
 
         let drained = with_watchdog(move || {
             let mut got = Vec::new();
@@ -265,7 +278,10 @@ mod tests {
             tx.send(int_batch(&[1])).await.unwrap();
             // bridge is full: send must yield to the executor, not block the thread
             let r = tokio::time::timeout(Duration::from_millis(50), tx.send(int_batch(&[2]))).await;
-            assert!(r.is_err(), "second send should be pending while no credit is free");
+            assert!(
+                r.is_err(),
+                "second send should be pending while no credit is free"
+            );
         });
     }
 
@@ -273,14 +289,19 @@ mod tests {
     fn bridge_send_errors_after_receiver_dropped() {
         let (tx, rx) = bridge(2);
         drop(rx);
-        let err = current_thread_rt().block_on(tx.send(int_batch(&[1]))).unwrap_err();
+        let err = current_thread_rt()
+            .block_on(tx.send(int_batch(&[1])))
+            .unwrap_err();
         assert!(matches!(err, EngineError::Io(_)));
     }
 
     #[test]
     fn bridge_no_deadlock_when_consumer_is_rayon_worker() {
         let result = with_watchdog(|| {
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
             let (tx, rx) = bridge(2);
             let producer = std::thread::spawn(move || {
                 current_thread_rt().block_on(async move {

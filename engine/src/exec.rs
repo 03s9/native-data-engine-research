@@ -13,38 +13,91 @@ use crate::types::{DataType, EngineError, Field, Result, SchemaRef};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub struct ExecContext { pub threads: usize, pub morsel_rows: usize, pub budget: Arc<MemoryBudget>, pub spill_dir: PathBuf }
+pub struct ExecContext {
+    pub threads: usize,
+    pub morsel_rows: usize,
+    pub budget: Arc<MemoryBudget>,
+    pub spill_dir: PathBuf,
+}
 
 /// Run `plan` and return its output batches. Output order and batch boundaries depend only on the plan,
 /// the data and `morsel_rows`, never on `threads`.
 pub fn execute(plan: &LogicalPlan, catalog: &Catalog, ctx: &ExecContext) -> Result<Vec<Batch>> {
     match plan {
-        LogicalPlan::Scan { table_name, schema, projection, projected_schema } => {
-            scan(catalog, table_name, schema, projection.as_deref(), projected_schema)
-        }
+        LogicalPlan::Scan {
+            table_name,
+            schema,
+            projection,
+            projected_schema,
+        } => scan(
+            catalog,
+            table_name,
+            schema,
+            projection.as_deref(),
+            projected_schema,
+        ),
         LogicalPlan::Filter { input, predicate } => {
             let input = execute(input, catalog, ctx)?;
             filter(input, predicate, ctx)
         }
-        LogicalPlan::Projection { input, exprs, schema } => {
+        LogicalPlan::Projection {
+            input,
+            exprs,
+            schema,
+        } => {
             let input = execute(input, catalog, ctx)?;
             project(input, exprs, schema, ctx)
         }
-        LogicalPlan::Join { left, right, join_type, on, schema } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            schema,
+        } => {
             let left = execute(left, catalog, ctx)?;
             let right = execute(right, catalog, ctx)?;
-            hash_join(left, right, *join_type, on, schema.clone(), &ctx.budget, &ctx.spill_dir)
+            hash_join(
+                left,
+                right,
+                *join_type,
+                on,
+                schema.clone(),
+                &ctx.budget,
+                &ctx.spill_dir,
+            )
         }
-        LogicalPlan::Aggregate { input, group_exprs, agg_exprs, schema } => {
+        LogicalPlan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            schema,
+        } => {
             if schema.fields.len() != group_exprs.len() + agg_exprs.len() {
-                return Err(EngineError::Plan("aggregate schema must be group exprs followed by aggregates".into()));
+                return Err(EngineError::Plan(
+                    "aggregate schema must be group exprs followed by aggregates".into(),
+                ));
             }
             let input = execute(input, catalog, ctx)?;
-            hash_aggregate(input, group_exprs, agg_exprs, schema.clone(), &ctx.budget, &ctx.spill_dir)
+            hash_aggregate(
+                input,
+                group_exprs,
+                agg_exprs,
+                schema.clone(),
+                &ctx.budget,
+                &ctx.spill_dir,
+            )
         }
         LogicalPlan::Sort { input, order_by } => {
             let input = execute(input, catalog, ctx)?;
-            sort_batches(input, plan.schema(), order_by, &ctx.budget, &ctx.spill_dir, ctx.morsel_rows.max(1))
+            sort_batches(
+                input,
+                plan.schema(),
+                order_by,
+                &ctx.budget,
+                &ctx.spill_dir,
+                ctx.morsel_rows.max(1),
+            )
         }
         LogicalPlan::Limit { input, skip, fetch } => {
             let input = execute(input, catalog, ctx)?;
@@ -54,30 +107,47 @@ pub fn execute(plan: &LogicalPlan, catalog: &Catalog, ctx: &ExecContext) -> Resu
 }
 
 fn scan(
-    catalog: &Catalog, table_name: &str, schema: &SchemaRef, projection: Option<&[usize]>, projected_schema: &SchemaRef,
+    catalog: &Catalog,
+    table_name: &str,
+    schema: &SchemaRef,
+    projection: Option<&[usize]>,
+    projected_schema: &SchemaRef,
 ) -> Result<Vec<Batch>> {
     let (table_schema, batches) = catalog.get(table_name)?;
     if table_schema != schema {
-        return Err(EngineError::Plan(format!("scan of '{table_name}': plan schema does not match catalog schema")));
+        return Err(EngineError::Plan(format!(
+            "scan of '{table_name}': plan schema does not match catalog schema"
+        )));
     }
     let expected: Vec<Field> = match projection {
         None => table_schema.fields.clone(),
         Some(idx) => {
             if let Some(&bad) = idx.iter().find(|&&i| i >= table_schema.fields.len()) {
-                return Err(EngineError::Plan(format!("scan of '{table_name}': projection index {bad} out of range")));
+                return Err(EngineError::Plan(format!(
+                    "scan of '{table_name}': projection index {bad} out of range"
+                )));
             }
-            idx.iter().map(|&i| table_schema.fields[i].clone()).collect()
+            idx.iter()
+                .map(|&i| table_schema.fields[i].clone())
+                .collect()
         }
     };
     if projected_schema.fields != expected {
-        return Err(EngineError::Plan(format!("scan of '{table_name}': projected schema does not match projection")));
+        return Err(EngineError::Plan(format!(
+            "scan of '{table_name}': projected schema does not match projection"
+        )));
     }
     let mut out = Vec::with_capacity(batches.len());
     for b in batches {
         let well_formed = b.columns.len() == table_schema.fields.len()
-            && b.columns.iter().zip(&table_schema.fields).all(|(c, f)| c.data_type() == f.data_type);
+            && b.columns
+                .iter()
+                .zip(&table_schema.fields)
+                .all(|(c, f)| c.data_type() == f.data_type);
         if !well_formed {
-            return Err(EngineError::Type(format!("table '{table_name}' has a batch that does not match its schema")));
+            return Err(EngineError::Type(format!(
+                "table '{table_name}' has a batch that does not match its schema"
+            )));
         }
         out.push(match projection {
             None => b.clone(),
@@ -89,7 +159,10 @@ fn scan(
 
 /// Split every input batch into morsels of at most `morsel_rows` rows, in input order.
 fn morsels_of(input: &[Batch], morsel_rows: usize) -> Vec<Batch> {
-    input.iter().flat_map(|b| split_morsels(b, morsel_rows)).collect()
+    input
+        .iter()
+        .flat_map(|b| split_morsels(b, morsel_rows))
+        .collect()
 }
 
 /// Drop zero-row batches so an empty result is an empty vec, the same as an empty input.
@@ -99,7 +172,10 @@ fn non_empty(batches: Vec<Batch>) -> Vec<Batch> {
 
 fn filter(input: Vec<Batch>, predicate: &Expr, ctx: &ExecContext) -> Result<Vec<Batch>> {
     if predicate.return_type() != DataType::Boolean {
-        return Err(EngineError::Type(format!("filter predicate must be Boolean, found {:?}", predicate.return_type())));
+        return Err(EngineError::Type(format!(
+            "filter predicate must be Boolean, found {:?}",
+            predicate.return_type()
+        )));
     }
     let predicate = optimize(predicate.clone());
     let morsels = morsels_of(&input, ctx.morsel_rows);
@@ -110,16 +186,30 @@ fn filter(input: Vec<Batch>, predicate: &Expr, ctx: &ExecContext) -> Result<Vec<
     Ok(non_empty(out))
 }
 
-fn project(input: Vec<Batch>, exprs: &[Expr], schema: &SchemaRef, ctx: &ExecContext) -> Result<Vec<Batch>> {
+fn project(
+    input: Vec<Batch>,
+    exprs: &[Expr],
+    schema: &SchemaRef,
+    ctx: &ExecContext,
+) -> Result<Vec<Batch>> {
     if exprs.is_empty() {
-        return Err(EngineError::Plan("projection needs at least one expression".into()));
+        return Err(EngineError::Plan(
+            "projection needs at least one expression".into(),
+        ));
     }
     if schema.fields.len() != exprs.len() {
-        return Err(EngineError::Plan("projection schema and expression count differ".into()));
+        return Err(EngineError::Plan(
+            "projection schema and expression count differ".into(),
+        ));
     }
     for (f, e) in schema.fields.iter().zip(exprs) {
         if f.data_type != e.return_type() {
-            return Err(EngineError::Type(format!("projection column '{}' declared {:?}, expression is {:?}", f.name, f.data_type, e.return_type())));
+            return Err(EngineError::Type(format!(
+                "projection column '{}' declared {:?}, expression is {:?}",
+                f.name,
+                f.data_type,
+                e.return_type()
+            )));
         }
     }
     let exprs: Vec<Expr> = exprs.iter().cloned().map(optimize).collect();
@@ -150,7 +240,11 @@ fn limit(input: Vec<Batch>, skip: usize, fetch: Option<usize>) -> Vec<Batch> {
         if let Some(r) = remaining.as_mut() {
             *r -= take;
         }
-        out.push(if start == 0 && take == n { b } else { b.slice(start, take) });
+        out.push(if start == 0 && take == n {
+            b
+        } else {
+            b.slice(start, take)
+        });
     }
     out
 }

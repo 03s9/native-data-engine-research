@@ -46,16 +46,27 @@ pub struct JoinStats {
 /// NULL keys never match. Duplicate keys: cross-product of matches. Skewed/duplicate-heavy partitions must
 /// terminate (fall back to chunked nested loop when re-partitioning makes no progress).
 pub fn hash_join(
-    left: Vec<Batch>, right: Vec<Batch>, join_type: JoinType, on: &[(Expr, Expr)], schema: SchemaRef,
-    budget: &Arc<MemoryBudget>, spill_dir: &Path,
+    left: Vec<Batch>,
+    right: Vec<Batch>,
+    join_type: JoinType,
+    on: &[(Expr, Expr)],
+    schema: SchemaRef,
+    budget: &Arc<MemoryBudget>,
+    spill_dir: &Path,
 ) -> Result<Vec<Batch>> {
-    hash_join_with_stats(left, right, join_type, on, schema, budget, spill_dir).map(|(batches, _)| batches)
+    hash_join_with_stats(left, right, join_type, on, schema, budget, spill_dir)
+        .map(|(batches, _)| batches)
 }
 
 /// `hash_join` that also reports what it did.
 pub fn hash_join_with_stats(
-    left: Vec<Batch>, right: Vec<Batch>, join_type: JoinType, on: &[(Expr, Expr)], schema: SchemaRef,
-    budget: &Arc<MemoryBudget>, spill_dir: &Path,
+    left: Vec<Batch>,
+    right: Vec<Batch>,
+    join_type: JoinType,
+    on: &[(Expr, Expr)],
+    schema: SchemaRef,
+    budget: &Arc<MemoryBudget>,
+    spill_dir: &Path,
 ) -> Result<(Vec<Batch>, JoinStats)> {
     for (l, r) in on {
         if l.return_type() != r.return_type() {
@@ -71,8 +82,22 @@ pub fn hash_join_with_stats(
     // Input widths. A side with no batches takes its width from the output schema.
     let (il, ir) = match (left.first(), right.first()) {
         (Some(l), Some(r)) => (l.columns.len(), r.columns.len()),
-        (Some(l), None) => (l.columns.len(), if semi { 0 } else { n.saturating_sub(l.columns.len()) }),
-        (None, Some(r)) => (if semi { n } else { n.saturating_sub(r.columns.len()) }, r.columns.len()),
+        (Some(l), None) => (
+            l.columns.len(),
+            if semi {
+                0
+            } else {
+                n.saturating_sub(l.columns.len())
+            },
+        ),
+        (None, Some(r)) => (
+            if semi {
+                n
+            } else {
+                n.saturating_sub(r.columns.len())
+            },
+            r.columns.len(),
+        ),
         (None, None) => (n, 0),
     };
     let width_ok = if semi { il == n } else { il + ir == n };
@@ -82,7 +107,11 @@ pub fn hash_join_with_stats(
         )));
     }
     let left_fields = schema.fields[..il].to_vec();
-    let right_fields = if semi { Vec::new() } else { schema.fields[il..].to_vec() };
+    let right_fields = if semi {
+        Vec::new()
+    } else {
+        schema.fields[il..].to_vec()
+    };
     let left_schema = match left.first() {
         Some(b) => b.schema.clone(),
         None => Arc::new(Schema::new(left_fields.clone())),
@@ -198,7 +227,11 @@ impl Join<'_> {
         let parent_rows = r.rows();
         for ((lp, lb), (rp, rb)) in lparts.iter().zip(&rparts) {
             // Re-partitioning moved no rows out of the build side: this key set cannot be split by hash.
-            let next = if rp.num_rows() == parent_rows { MAX_DEPTH } else { depth + 1 };
+            let next = if rp.num_rows() == parent_rows {
+                MAX_DEPTH
+            } else {
+                depth + 1
+            };
             self.join_pair(Source::File(lp, *lb), Source::File(rp, *rb), next)?;
         }
         Ok(())
@@ -207,7 +240,12 @@ impl Join<'_> {
     /// Splits `src` into PARTITIONS spill files by a depth-seeded hash of the join key, each with its measured
     /// in-memory bytes. NULL-key rows go to partition 0 on both sides (they never match, so placement is
     /// irrelevant to the result).
-    fn partition(&mut self, src: Source, side: Side, seed: usize) -> Result<Vec<(SpillFile, usize)>> {
+    fn partition(
+        &mut self,
+        src: Source,
+        side: Side,
+        seed: usize,
+    ) -> Result<Vec<(SpillFile, usize)>> {
         let schema = match side {
             Side::Left => self.left_schema.clone(),
             Side::Right => self.right_schema.clone(),
@@ -218,7 +256,10 @@ impl Join<'_> {
         self.stats.spill_files += PARTITIONS;
         let mut bytes = vec![0usize; PARTITIONS];
         let on = self.on;
-        let exprs: Vec<&Expr> = on.iter().map(|(l, r)| if side == Side::Left { l } else { r }).collect();
+        let exprs: Vec<&Expr> = on
+            .iter()
+            .map(|(l, r)| if side == Side::Left { l } else { r })
+            .collect();
         src.for_each(&mut |b: &Batch| {
             if b.num_rows == 0 {
                 return Ok(());
@@ -228,7 +269,11 @@ impl Join<'_> {
             let mut buf = Vec::new();
             for i in 0..b.num_rows {
                 buf.clear();
-                let p = if encode_key(&keys, i, &mut buf) { partition_of(&buf, seed) } else { 0 };
+                let p = if encode_key(&keys, i, &mut buf) {
+                    partition_of(&buf, seed)
+                } else {
+                    0
+                };
                 buckets[p].push(i);
             }
             for ((w, idx), nb) in writers.iter_mut().zip(&buckets).zip(bytes.iter_mut()) {
@@ -240,14 +285,25 @@ impl Join<'_> {
             }
             Ok(())
         })?;
-        writers.into_iter().zip(bytes).map(|(w, nb)| w.finish().map(|f| (f, nb))).collect()
+        writers
+            .into_iter()
+            .zip(bytes)
+            .map(|(w, nb)| w.finish().map(|f| (f, nb)))
+            .collect()
     }
 
     /// Joins `l` with `r` in build chunks. A chunk takes right rows while their measured bytes, plus hash
     /// overhead, stay within `target_bytes`. The first row of a chunk is always taken.
     fn chunked(&mut self, l: Source, r: Source, target_bytes: usize) -> Result<()> {
-        let needs_left_pass = matches!(self.jt, JoinType::Left | JoinType::Full | JoinType::Semi | JoinType::Anti);
-        let mut bits = if needs_left_pass { vec![false; l.rows()] } else { Vec::new() };
+        let needs_left_pass = matches!(
+            self.jt,
+            JoinType::Left | JoinType::Full | JoinType::Semi | JoinType::Anti
+        );
+        let mut bits = if needs_left_pass {
+            vec![false; l.rows()]
+        } else {
+            Vec::new()
+        };
         let kcost = ENTRY_OVERHEAD + KEY_BYTES * self.on.len();
         let mut pending: Vec<Batch> = Vec::new();
         let mut pending_rows = 0usize;
@@ -310,7 +366,10 @@ impl Join<'_> {
         self.stats.build_chunks += 1;
         let build = Batch::concat(self.right_schema.clone(), parts)?;
         let mut table = Table::build(build, self.on, self.budget)?;
-        let emits = matches!(self.jt, JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full);
+        let emits = matches!(
+            self.jt,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+        );
         let on = self.on;
         let on_l: Vec<&Expr> = on.iter().map(|(le, _)| le).collect();
         let mut base = 0usize;
@@ -360,7 +419,10 @@ impl Table {
         let res = budget.try_reserve(est)?;
         let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         if build.num_rows > 0 {
-            let keys: Vec<Column> = on.iter().map(|(_, r)| eval(r, &build)).collect::<Result<_>>()?;
+            let keys: Vec<Column> = on
+                .iter()
+                .map(|(_, r)| eval(r, &build))
+                .collect::<Result<_>>()?;
             let mut buf = Vec::new();
             for i in 0..build.num_rows {
                 buf.clear();
@@ -376,12 +438,24 @@ impl Table {
             }
         }
         let matched = vec![false; build.num_rows];
-        Ok(Table { build, index, matched, _res: res })
+        Ok(Table {
+            build,
+            index,
+            matched,
+            _res: res,
+        })
     }
 
     /// Probes `probe` (left rows starting at global index `base`). Returns matched pairs when `emits`.
     /// Sets `bits` for matched left rows when `bits` is non-empty.
-    fn probe(&mut self, probe: &Batch, base: usize, on_l: &[&Expr], emits: bool, bits: &mut [bool]) -> Result<Vec<Pair>> {
+    fn probe(
+        &mut self,
+        probe: &Batch,
+        base: usize,
+        on_l: &[&Expr],
+        emits: bool,
+        bits: &mut [bool],
+    ) -> Result<Vec<Pair>> {
         let mut pairs = Vec::new();
         if probe.num_rows == 0 {
             return Ok(pairs);
@@ -394,7 +468,9 @@ impl Table {
             if !encode_key(&keys, i, &mut buf) {
                 continue;
             }
-            let Some(js) = self.index.get(buf.as_slice()) else { continue };
+            let Some(js) = self.index.get(buf.as_slice()) else {
+                continue;
+            };
             if track {
                 bits[base + i] = true;
             }
@@ -488,7 +564,11 @@ fn compact_slice(batch: &Batch, start: usize, len: usize) -> Batch {
             Column { values, validity }
         })
         .collect();
-    Batch { schema: batch.schema.clone(), columns, num_rows: len }
+    Batch {
+        schema: batch.schema.clone(),
+        columns,
+        num_rows: len,
+    }
 }
 
 fn partition_of(key: &[u8], seed: usize) -> usize {
@@ -502,7 +582,10 @@ fn partition_of(key: &[u8], seed: usize) -> usize {
 fn gather(src: Option<&Batch>, fields: &[Field], idx: &[Option<usize>]) -> Vec<Column> {
     match src {
         Some(b) if b.num_rows > 0 => b.columns.iter().map(|c| gather_opt(c, idx)).collect(),
-        _ => fields.iter().map(|f| null_column(f.data_type, idx.len())).collect(),
+        _ => fields
+            .iter()
+            .map(|f| null_column(f.data_type, idx.len()))
+            .collect(),
     }
 }
 
@@ -530,7 +613,10 @@ fn null_column(dt: DataType, n: usize) -> Column {
         DataType::Float64 => Values::Float64(vec![0.0; n]),
         DataType::Utf8 => Values::Utf8(StringViews::from_strs(&vec![""; n])),
     };
-    Column { values, validity: Some(vec![false; n]) }
+    Column {
+        values,
+        validity: Some(vec![false; n]),
+    }
 }
 
 #[cfg(test)]
@@ -614,7 +700,13 @@ mod tests {
         out
     }
 
-    fn run(jt: JoinType, left: Vec<Batch>, right: Vec<Batch>, on: &[(Expr, Expr)], budget: &Arc<MemoryBudget>) -> Result<Vec<Batch>> {
+    fn run(
+        jt: JoinType,
+        left: Vec<Batch>,
+        right: Vec<Batch>,
+        on: &[(Expr, Expr)],
+        budget: &Arc<MemoryBudget>,
+    ) -> Result<Vec<Batch>> {
         hash_join(left, right, jt, on, out_schema(jt), budget, &tmp())
     }
 
@@ -624,8 +716,16 @@ mod tests {
 
     // Left keys/values: (1,10) (2,20) (2,21) (NULL,30). Right: (2,200) (2,201) (3,300) (NULL,400).
     fn fixture() -> (Vec<Batch>, Vec<Batch>) {
-        let l = side(&[Some(1), Some(2), Some(2), None], &[10, 20, 21, 30], &left_schema());
-        let r = side(&[Some(2), Some(2), Some(3), None], &[200, 201, 300, 400], &right_schema());
+        let l = side(
+            &[Some(1), Some(2), Some(2), None],
+            &[10, 20, 21, 30],
+            &left_schema(),
+        );
+        let r = side(
+            &[Some(2), Some(2), Some(3), None],
+            &[200, 201, 300, 400],
+            &right_schema(),
+        );
         (vec![l], vec![r])
     }
 
@@ -695,8 +795,14 @@ mod tests {
     fn nulls_on_both_sides_do_not_match_each_other() {
         let l = side(&[None, None], &[1, 2], &left_schema());
         let r = side(&[None], &[9], &right_schema());
-        assert!(cells(&run(Inner, vec![l.clone()], vec![r.clone()], &on_lr(), &big()).unwrap()).is_empty());
-        assert_eq!(cells(&run(Full, vec![l], vec![r], &on_lr(), &big()).unwrap()).len(), 3);
+        assert!(
+            cells(&run(Inner, vec![l.clone()], vec![r.clone()], &on_lr(), &big()).unwrap())
+                .is_empty()
+        );
+        assert_eq!(
+            cells(&run(Full, vec![l], vec![r], &on_lr(), &big()).unwrap()).len(),
+            3
+        );
     }
 
     #[test]
@@ -709,19 +815,44 @@ mod tests {
 
     #[test]
     fn multi_column_keys_match_on_both_columns() {
-        let ls = Schema::new(vec![f("a", DataType::Int64), f("b", DataType::Int64), f("lv", DataType::Int64)]);
-        let rs = Schema::new(vec![f("c", DataType::Int64), f("d", DataType::Int64), f("rv", DataType::Int64)]);
+        let ls = Schema::new(vec![
+            f("a", DataType::Int64),
+            f("b", DataType::Int64),
+            f("lv", DataType::Int64),
+        ]);
+        let rs = Schema::new(vec![
+            f("c", DataType::Int64),
+            f("d", DataType::Int64),
+            f("rv", DataType::Int64),
+        ]);
         let mut fields = ls.fields.clone();
         fields.extend(rs.fields.clone());
         let schema = Arc::new(Schema::new(fields));
-        let l = batch(&ls, vec![Column::from_i64(vec![1, 1, 2]), Column::from_i64(vec![1, 2, 2]), Column::from_i64(vec![100, 200, 300])]);
-        let r = batch(&rs, vec![Column::from_i64(vec![1, 2]), Column::from_i64(vec![2, 2]), Column::from_i64(vec![7, 8])]);
+        let l = batch(
+            &ls,
+            vec![
+                Column::from_i64(vec![1, 1, 2]),
+                Column::from_i64(vec![1, 2, 2]),
+                Column::from_i64(vec![100, 200, 300]),
+            ],
+        );
+        let r = batch(
+            &rs,
+            vec![
+                Column::from_i64(vec![1, 2]),
+                Column::from_i64(vec![2, 2]),
+                Column::from_i64(vec![7, 8]),
+            ],
+        );
         let on = vec![
             (col(&ls, "a").unwrap(), col(&rs, "c").unwrap()),
             (col(&ls, "b").unwrap(), col(&rs, "d").unwrap()),
         ];
         let got = hash_join(vec![l], vec![r], Inner, &on, schema, &big(), &tmp()).unwrap();
-        assert_eq!(cells(&got), vec![sr(&[1, 2, 200, 1, 2, 7]), sr(&[2, 2, 300, 2, 2, 8])]);
+        assert_eq!(
+            cells(&got),
+            vec![sr(&[1, 2, 200, 1, 2, 7]), sr(&[2, 2, 300, 2, 2, 8])]
+        );
     }
 
     #[test]
@@ -740,13 +871,22 @@ mod tests {
     fn empty_right_side_left_join_is_all_unmatched() {
         let l = side(&keys(&[1, 2]), &[10, 20], &left_schema());
         let got = cells(&run(Left, vec![l], vec![], &on_lr(), &big()).unwrap());
-        assert_eq!(got, vec![vrow(&[Some(1), Some(10), None, None]), vrow(&[Some(2), Some(20), None, None])]);
+        assert_eq!(
+            got,
+            vec![
+                vrow(&[Some(1), Some(10), None, None]),
+                vrow(&[Some(2), Some(20), None, None])
+            ]
+        );
     }
 
     #[test]
     fn empty_right_side_anti_keeps_everything() {
         let l = side(&keys(&[1, 2]), &[10, 20], &left_schema());
-        assert_eq!(cells(&run(Anti, vec![l], vec![], &on_lr(), &big()).unwrap()).len(), 2);
+        assert_eq!(
+            cells(&run(Anti, vec![l], vec![], &on_lr(), &big()).unwrap()).len(),
+            2
+        );
     }
 
     #[test]
@@ -763,8 +903,16 @@ mod tests {
 
     #[test]
     fn output_is_split_into_batches_of_at_most_8192_rows() {
-        let l = side(&keys(&[1; 200]), &(0..200).collect::<Vec<_>>(), &left_schema());
-        let r = side(&keys(&[1; 100]), &(0..100).collect::<Vec<_>>(), &right_schema());
+        let l = side(
+            &keys(&[1; 200]),
+            &(0..200).collect::<Vec<_>>(),
+            &left_schema(),
+        );
+        let r = side(
+            &keys(&[1; 100]),
+            &(0..100).collect::<Vec<_>>(),
+            &right_schema(),
+        );
         let got = run(Inner, vec![l], vec![r], &on_lr(), &big()).unwrap();
         assert_eq!(got.iter().map(|b| b.num_rows).sum::<usize>(), 20_000);
         assert!(got.iter().all(|b| b.num_rows <= BATCH_ROWS));
@@ -791,11 +939,26 @@ mod tests {
         fields.extend(rs.fields.clone());
         let schema = Arc::new(Schema::new(fields));
         let long = "a key that is much longer than twelve bytes";
-        let l = batch(&ls, vec![Column::from_strs(&[long, "short"]), Column::from_i64(vec![1, 2])]);
-        let r = batch(&rs, vec![Column::from_strs(&["short", long, "other"]), Column::from_i64(vec![9, 8, 7])]);
+        let l = batch(
+            &ls,
+            vec![
+                Column::from_strs(&[long, "short"]),
+                Column::from_i64(vec![1, 2]),
+            ],
+        );
+        let r = batch(
+            &rs,
+            vec![
+                Column::from_strs(&["short", long, "other"]),
+                Column::from_i64(vec![9, 8, 7]),
+            ],
+        );
         let on = vec![(col(&ls, "k").unwrap(), col(&rs, "rk").unwrap())];
         let got = hash_join(vec![l], vec![r], Inner, &on, schema, &big(), &tmp()).unwrap();
-        let rows: Vec<Vec<S>> = got.iter().flat_map(|b| (0..b.num_rows).map(move |i| b.row(i))).collect();
+        let rows: Vec<Vec<S>> = got
+            .iter()
+            .flat_map(|b| (0..b.num_rows).map(move |i| b.row(i)))
+            .collect();
         assert_eq!(rows.len(), 2);
     }
 
@@ -804,7 +967,16 @@ mod tests {
         let ls = left_schema();
         let rs = Schema::new(vec![f("rk", DataType::Utf8), f("rv", DataType::Int64)]);
         let on = vec![(col(&ls, "lk").unwrap(), col(&rs, "rk").unwrap())];
-        let err = hash_join(vec![], vec![], Inner, &on, out_schema(Inner), &big(), &tmp()).unwrap_err();
+        let err = hash_join(
+            vec![],
+            vec![],
+            Inner,
+            &on,
+            out_schema(Inner),
+            &big(),
+            &tmp(),
+        )
+        .unwrap_err();
         assert!(matches!(err, EngineError::Type(_)));
     }
 
@@ -826,7 +998,14 @@ mod tests {
 
     #[test]
     fn all_join_types_with_duplicates_match_fixture_counts() {
-        let counts = [(Inner, 4), (Left, 6), (Right, 6), (Full, 8), (Semi, 2), (Anti, 2)];
+        let counts = [
+            (Inner, 4),
+            (Left, 6),
+            (Right, 6),
+            (Full, 8),
+            (Semi, 2),
+            (Anti, 2),
+        ];
         for (jt, n) in counts {
             assert_eq!(run_fixture(jt).len(), n, "{jt:?}");
         }
@@ -834,7 +1013,13 @@ mod tests {
 
     fn random_side(rng: &mut StdRng, n: usize, key_range: i64, s: &Schema) -> Batch {
         let keys: Vec<Option<i64>> = (0..n)
-            .map(|_| if rng.gen_range(0..20) == 0 { None } else { Some(rng.gen_range(0..key_range)) })
+            .map(|_| {
+                if rng.gen_range(0..20) == 0 {
+                    None
+                } else {
+                    Some(rng.gen_range(0..key_range))
+                }
+            })
             .collect();
         let vals: Vec<i64> = (0..n).map(|_| rng.gen_range(-1000..1000)).collect();
         side(&keys, &vals, s)
@@ -848,8 +1033,16 @@ mod tests {
         for jt in [Inner, Left, Right, Full, Semi, Anti] {
             let want = cells(&run(jt, left.clone(), right.clone(), &on_lr(), &big()).unwrap());
             let tiny = MemoryBudget::new(64 * 1024);
-            let (got_batches, stats) =
-                hash_join_with_stats(left.clone(), right.clone(), jt, &on_lr(), out_schema(jt), &tiny, &tmp()).unwrap();
+            let (got_batches, stats) = hash_join_with_stats(
+                left.clone(),
+                right.clone(),
+                jt,
+                &on_lr(),
+                out_schema(jt),
+                &tiny,
+                &tmp(),
+            )
+            .unwrap();
             assert!(stats.spill_files > 0, "{jt:?} did not spill");
             assert!(stats.max_depth >= 1, "{jt:?} did not repartition");
             assert_eq!(cells(&got_batches), want, "{jt:?} spilled result differs");
@@ -872,13 +1065,29 @@ mod tests {
 
     #[test]
     fn skewed_all_same_key_spilled_join_terminates() {
-        let left = vec![side(&keys(&[1; 30]), &(0..30).collect::<Vec<_>>(), &left_schema())];
-        let right = vec![side(&keys(&[1; 2000]), &(0..2000).collect::<Vec<_>>(), &right_schema())];
+        let left = vec![side(
+            &keys(&[1; 30]),
+            &(0..30).collect::<Vec<_>>(),
+            &left_schema(),
+        )];
+        let right = vec![side(
+            &keys(&[1; 2000]),
+            &(0..2000).collect::<Vec<_>>(),
+            &right_schema(),
+        )];
         let on = on_lr();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let tiny = MemoryBudget::new(4096);
-            let r = hash_join_with_stats(left, right, Inner, &on, out_schema(Inner), &tiny, &std::env::temp_dir());
+            let r = hash_join_with_stats(
+                left,
+                right,
+                Inner,
+                &on,
+                out_schema(Inner),
+                &tiny,
+                &std::env::temp_dir(),
+            );
             let _ = tx.send(r.map(|(b, s)| (b.iter().map(|x| x.num_rows).sum::<usize>(), s)));
         });
         let (rows, stats) = rx
@@ -892,13 +1101,29 @@ mod tests {
 
     #[test]
     fn skewed_join_with_left_and_full_types_terminates_with_correct_counts() {
-        let left = vec![side(&keys(&[1; 10]), &(0..10).collect::<Vec<_>>(), &left_schema())];
-        let right = vec![side(&keys(&[2; 500]), &(0..500).collect::<Vec<_>>(), &right_schema())];
+        let left = vec![side(
+            &keys(&[1; 10]),
+            &(0..10).collect::<Vec<_>>(),
+            &left_schema(),
+        )];
+        let right = vec![side(
+            &keys(&[2; 500]),
+            &(0..500).collect::<Vec<_>>(),
+            &right_schema(),
+        )];
         let on = on_lr();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let tiny = MemoryBudget::new(4096);
-            let r = hash_join(left, right, Full, &on, out_schema(Full), &tiny, &std::env::temp_dir());
+            let r = hash_join(
+                left,
+                right,
+                Full,
+                &on,
+                out_schema(Full),
+                &tiny,
+                &std::env::temp_dir(),
+            );
             let _ = tx.send(r.map(|b| cells(&b).len()));
         });
         let n = rx
@@ -924,7 +1149,10 @@ mod tests {
     }
 
     fn on_lk_rk() -> Vec<(Expr, Expr)> {
-        vec![(col(&left_schema(), "lk").unwrap(), col(&str_side_schema(), "rk").unwrap())]
+        vec![(
+            col(&left_schema(), "lk").unwrap(),
+            col(&str_side_schema(), "rk").unwrap(),
+        )]
     }
 
     /// Sorted rendering of every row, so results compare regardless of batch layout.
@@ -938,7 +1166,11 @@ mod tests {
     }
 
     /// Left: keys [7, 8]. Right: `right_rows` rows all keyed 7, payload `payload(i)`, split into batches of `split` rows.
-    fn skew_inputs(right_rows: usize, split: usize, payload: &dyn Fn(usize) -> String) -> (Vec<Batch>, Vec<Batch>) {
+    fn skew_inputs(
+        right_rows: usize,
+        split: usize,
+        payload: &dyn Fn(usize) -> String,
+    ) -> (Vec<Batch>, Vec<Batch>) {
         let left = vec![side(&[Some(7), Some(8)], &[0, 1], &left_schema())];
         let rs = str_side_schema();
         let mut right = Vec::new();
@@ -946,7 +1178,13 @@ mod tests {
         while start < right_rows {
             let end = (start + split).min(right_rows);
             let strs: Vec<String> = (start..end).map(payload).collect();
-            right.push(batch(&rs, vec![Column::from_i64(vec![7; end - start]), Column::from_strs(&strs)]));
+            right.push(batch(
+                &rs,
+                vec![
+                    Column::from_i64(vec![7; end - start]),
+                    Column::from_strs(&strs),
+                ],
+            ));
             start = end;
         }
         (left, right)
@@ -961,7 +1199,9 @@ mod tests {
             let _ = tx.send(());
         });
         match rx.recv_timeout(Duration::from_secs(30)) {
-            Err(mpsc::RecvTimeoutError::Timeout) => panic!("{name} did not finish within 30 seconds"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{name} did not finish within 30 seconds")
+            }
             _ => {
                 if let Err(p) = worker.join() {
                     std::panic::resume_unwind(p);
@@ -986,12 +1226,31 @@ mod tests {
         ofields.extend(rs.fields.clone());
         let out = Arc::new(Schema::new(ofields));
         let on = vec![(col(&ls, "lk").unwrap(), col(&rs, "rk").unwrap())];
-        let want = sorted_debug(&hash_join(left.clone(), right.clone(), Inner, &on, out.clone(), &big(), &tmp()).unwrap());
+        let want = sorted_debug(
+            &hash_join(
+                left.clone(),
+                right.clone(),
+                Inner,
+                &on,
+                out.clone(),
+                &big(),
+                &tmp(),
+            )
+            .unwrap(),
+        );
         assert_eq!(want.len(), n);
         for budget in [150_000, 200_000, 250_000] {
             let tiny = MemoryBudget::new(budget);
-            let got = hash_join(left.clone(), right.clone(), Inner, &on, out.clone(), &tiny, &tmp())
-                .unwrap_or_else(|e| panic!("budget {budget}: {e:?}"));
+            let got = hash_join(
+                left.clone(),
+                right.clone(),
+                Inner,
+                &on,
+                out.clone(),
+                &tiny,
+                &tmp(),
+            )
+            .unwrap_or_else(|e| panic!("budget {budget}: {e:?}"));
             assert_eq!(sorted_debug(&got), want, "budget {budget}");
         }
     }
@@ -1002,12 +1261,35 @@ mod tests {
             let (left, right) = skew_inputs(10_000, 10_000, &|i| format!("{:0>100}", i));
             for jt in [Inner, Left] {
                 let on = on_lk_rk();
-                let want = sorted_debug(&hash_join(left.clone(), right.clone(), jt, &on, str_out_schema(), &big(), &tmp()).unwrap());
-                assert_eq!(want.len(), if jt == Inner { 10_000 } else { 10_001 }, "{jt:?} in-memory count");
+                let want = sorted_debug(
+                    &hash_join(
+                        left.clone(),
+                        right.clone(),
+                        jt,
+                        &on,
+                        str_out_schema(),
+                        &big(),
+                        &tmp(),
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(
+                    want.len(),
+                    if jt == Inner { 10_000 } else { 10_001 },
+                    "{jt:?} in-memory count"
+                );
                 for budget in [800_000, 200_000] {
                     let tiny = MemoryBudget::new(budget);
-                    let got = hash_join(left.clone(), right.clone(), jt, &on, str_out_schema(), &tiny, &tmp())
-                        .unwrap_or_else(|e| panic!("{jt:?} budget {budget}: {e:?}"));
+                    let got = hash_join(
+                        left.clone(),
+                        right.clone(),
+                        jt,
+                        &on,
+                        str_out_schema(),
+                        &tiny,
+                        &tmp(),
+                    )
+                    .unwrap_or_else(|e| panic!("{jt:?} budget {budget}: {e:?}"));
                     assert_eq!(sorted_debug(&got), want, "{jt:?} budget {budget}");
                 }
             }
@@ -1020,11 +1302,30 @@ mod tests {
             let (left, right) = skew_inputs(10_000, 100, &|_| "x".to_string());
             for jt in [Inner, Left] {
                 let on = on_lk_rk();
-                let want = sorted_debug(&hash_join(left.clone(), right.clone(), jt, &on, str_out_schema(), &big(), &tmp()).unwrap());
+                let want = sorted_debug(
+                    &hash_join(
+                        left.clone(),
+                        right.clone(),
+                        jt,
+                        &on,
+                        str_out_schema(),
+                        &big(),
+                        &tmp(),
+                    )
+                    .unwrap(),
+                );
                 for budget in [50_000, 200_000, 800_000] {
                     let tiny = MemoryBudget::new(budget);
-                    let got = hash_join(left.clone(), right.clone(), jt, &on, str_out_schema(), &tiny, &tmp())
-                        .unwrap_or_else(|e| panic!("{jt:?} budget {budget}: {e:?}"));
+                    let got = hash_join(
+                        left.clone(),
+                        right.clone(),
+                        jt,
+                        &on,
+                        str_out_schema(),
+                        &tiny,
+                        &tmp(),
+                    )
+                    .unwrap_or_else(|e| panic!("{jt:?} budget {budget}: {e:?}"));
                     assert_eq!(sorted_debug(&got), want, "{jt:?} budget {budget}");
                 }
             }
@@ -1044,24 +1345,61 @@ mod tests {
             let rstrs: Vec<String> = (0..nr)
                 .map(|_| {
                     let len = rng.gen_range(0..=60usize);
-                    (0..len).map(|_| char::from(rng.gen_range(b'a'..=b'z'))).collect()
+                    (0..len)
+                        .map(|_| char::from(rng.gen_range(b'a'..=b'z')))
+                        .collect()
                 })
                 .collect();
             let left = vec![side(&keys(&lkeys), &lvals, &left_schema())];
-            let right = vec![batch(&str_side_schema(), vec![Column::from_i64(rkeys), Column::from_strs(&rstrs)])];
-            let want = sorted_debug(&hash_join(left.clone(), right.clone(), Inner, &on, str_out_schema(), &big(), &tmp()).unwrap());
+            let right = vec![batch(
+                &str_side_schema(),
+                vec![Column::from_i64(rkeys), Column::from_strs(&rstrs)],
+            )];
+            let want = sorted_debug(
+                &hash_join(
+                    left.clone(),
+                    right.clone(),
+                    Inner,
+                    &on,
+                    str_out_schema(),
+                    &big(),
+                    &tmp(),
+                )
+                .unwrap(),
+            );
             let big_row = rstrs
                 .iter()
-                .map(|s| 8 + 16 + if s.len() > 12 { s.len() } else { 0 } + ENTRY_OVERHEAD + KEY_BYTES)
+                .map(|s| {
+                    8 + 16 + if s.len() > 12 { s.len() } else { 0 } + ENTRY_OVERHEAD + KEY_BYTES
+                })
                 .max()
                 .unwrap_or(0);
-            let ok = hash_join(left.clone(), right.clone(), Inner, &on, str_out_schema(), &MemoryBudget::new(20_000), &tmp())
-                .unwrap_or_else(|e| panic!("case {case} budget 20000: {e:?}"));
+            let ok = hash_join(
+                left.clone(),
+                right.clone(),
+                Inner,
+                &on,
+                str_out_schema(),
+                &MemoryBudget::new(20_000),
+                &tmp(),
+            )
+            .unwrap_or_else(|e| panic!("case {case} budget 20000: {e:?}"));
             assert_eq!(sorted_debug(&ok), want, "case {case} budget 20000");
-            match hash_join(left.clone(), right.clone(), Inner, &on, str_out_schema(), &MemoryBudget::new(6_000), &tmp()) {
+            match hash_join(
+                left.clone(),
+                right.clone(),
+                Inner,
+                &on,
+                str_out_schema(),
+                &MemoryBudget::new(6_000),
+                &tmp(),
+            ) {
                 Ok(got) => assert_eq!(sorted_debug(&got), want, "case {case} budget 6000"),
                 Err(EngineError::Memory { .. }) => {
-                    assert!(6_000 < big_row, "case {case}: Memory at 6000 though a build row costs {big_row}")
+                    assert!(
+                        6_000 < big_row,
+                        "case {case}: Memory at 6000 though a build row costs {big_row}"
+                    )
                 }
                 Err(e) => panic!("case {case} budget 6000: {e:?}"),
             }
