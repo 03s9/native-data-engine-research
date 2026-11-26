@@ -1070,6 +1070,21 @@ mod tests {
         assert!(matches!(compile(&pred), Err(EngineError::Plan(_))));
         dismantle(pred);
 
+        // Other node kinds at the limit: Neg (JIT and eval) and nested CASE (eval only).
+        let mut negs = c(&s, "a");
+        for _ in 1..MAX_EXPR_DEPTH {
+            negs = neg(negs);
+        }
+        assert_matches_eval(&negs, &batch);
+        let mut cases = c(&s, "a");
+        // The condition has depth 2, so 126 wraps reach depth 128.
+        for _ in 2..MAX_EXPR_DEPTH {
+            let cond = bin(c(&s, "a"), BinaryOp::Gt, lit_i(1));
+            cases = case(cond, c(&s, "a"), cases).unwrap();
+        }
+        assert_eq!(cases.depth(), MAX_EXPR_DEPTH);
+        assert!(eval(&cases, &batch).is_ok());
+
         let deep = chain(&s, 100_000);
         assert!(!supports(&deep));
         assert!(matches!(compile(&deep), Err(EngineError::Plan(_))));
