@@ -11,13 +11,14 @@
 use native_engine::column::{schema_ref, Batch, Column, Values};
 use native_engine::eval::{binary, case, cast, col, eval, lit, unary};
 use native_engine::expr::{BinaryOp, Expr, UnaryOp};
-use native_engine::jit::{compile, supports, CompiledKernel};
+use native_engine::jit::{compile, compile_with, supports, Codegen, CompiledKernel};
 use native_engine::types::{DataType, EngineError, Field, ScalarValue, Schema, SchemaRef};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 const SEED: u64 = 0x5EED_0003;
-const SIZES: [usize; 12] = [0, 1, 2, 7, 8, 9, 63, 64, 65, 8191, 8192, 8193];
+// Odd sizes exercise the vector loop's scalar tail (Codegen::Vector handles two rows per step).
+const SIZES: [usize; 13] = [0, 1, 2, 3, 7, 8, 9, 63, 64, 65, 8191, 8192, 8193];
 /// Batch variants per size: 0 no masks, 1 all valid, 2 all null, 3 random per column, 4 mixed per column.
 const VARIANTS: usize = 5;
 const MAX_DEPTH: usize = 6;
@@ -594,7 +595,9 @@ fn diff_case(expr: &Expr, kernel: &CompiledKernel, batch: &Batch) -> Result<Outc
 }
 
 /// Minimal repro: the first diverging row, then descend into child subtrees while they still diverge.
+/// Uses the scalar kernel: a one-row batch never enters the vector loop anyway.
 fn minimise(expr: &Expr, batch: &Batch) -> String {
+    let compile = |e: &Expr| compile_with(e, Codegen::Scalar);
     let Ok(kernel) = compile(expr) else {
         return format!("compile failed: {expr:?}");
     };
@@ -651,6 +654,9 @@ struct Stats {
     both_err: usize,
     nan_rows: usize,
     nan_cases: usize,
+    /// Same comparisons repeated with `Codegen::Vector`; not counted in the fields above.
+    vector_cases: usize,
+    vector_nan_rows: usize,
     max_depth: usize,
     depth_at_max: usize,
     divergences: Vec<String>,
@@ -715,11 +721,21 @@ fn random_expressions_match_eval_over_seeded_batches() {
         if matches!(expr, Expr::Column { .. } | Expr::Literal(_)) {
             continue;
         }
-        let kernel = match compile(&expr) {
+        // Explicit codegens: `compile` picks one per expression, which would leave the other untested.
+        let kernel = match compile_with(&expr, Codegen::Scalar) {
             Ok(k) => k,
             Err(e) => {
                 stats.divergences.push(format!(
                     "compile() failed on a supported shape ({e}): {expr:?}"
+                ));
+                continue;
+            }
+        };
+        let vector = match compile_with(&expr, Codegen::Vector) {
+            Ok(k) => k,
+            Err(e) => {
+                stats.divergences.push(format!(
+                    "compile_with(Vector) failed on a supported shape ({e}): {expr:?}"
                 ));
                 continue;
             }
@@ -732,6 +748,17 @@ fn random_expressions_match_eval_over_seeded_batches() {
             let second = (first + 1 + gen.rng.gen_range(0..VARIANTS - 1)) % VARIANTS;
             for v in [first, second] {
                 let batch = &batches[si][v];
+                match diff_case(&expr, &vector, batch) {
+                    Ok(Outcome::Compared { nan_rows }) => {
+                        stats.vector_cases += 1;
+                        stats.vector_nan_rows += nan_rows;
+                    }
+                    Ok(Outcome::BothErr) => {}
+                    Err(msg) => stats.divergences.push(format!(
+                        "vector codegen, size {} variant {v}: {msg}\n    {expr:?}",
+                        SIZES[si]
+                    )),
+                }
                 match diff_case(&expr, &kernel, batch) {
                     Ok(Outcome::Compared { nan_rows }) => {
                         stats.supported_cases += 1;
@@ -775,6 +802,10 @@ fn random_expressions_match_eval_over_seeded_batches() {
         "jit_diff: documented NaN-payload-only difference: rows={} cases={}",
         stats.nan_rows, stats.nan_cases
     );
+    println!(
+        "jit_diff: vector codegen cases compared={} NaN-payload-only rows={}",
+        stats.vector_cases, stats.vector_nan_rows
+    );
     println!("jit_diff: divergences={}", stats.divergences.len());
 
     assert!(
@@ -788,6 +819,10 @@ fn random_expressions_match_eval_over_seeded_batches() {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n")
+    );
+    assert_eq!(
+        stats.vector_cases, stats.supported_cases,
+        "vector codegen must be compared on every case the scalar kernel is"
     );
     assert!(
         stats.supported_cases >= MIN_SUPPORTED_CASES,

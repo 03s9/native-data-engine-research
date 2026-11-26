@@ -1,11 +1,13 @@
 //! Cranelift JIT for arithmetic expressions (experiment H1a, see docs/PLAN.md).
-//! One fused scalar loop per expression: no intermediate columns.
+//! One fused loop per expression, no intermediate columns: scalar (one row per iteration) or,
+//! on aarch64, two rows per iteration in I64X2/F64X2 registers (see `Codegen`, docs/RESULTS-H1A-VEC.md).
 //!
 //! Kernel ABI: `extern "C" fn(cols: *const *const u8, n: usize, out: *mut u8)`.
 //! `cols[k]` points at the values of the k-th referenced column (8 bytes per row),
 //! `out` at the output values (8 bytes per row for Int64/Float64, 1 byte per row for Boolean).
 //! NULLs are handled outside the kernel: output validity = AND of the input validities.
 use crate::column::{Batch, Column, Values};
+use crate::eval::check_depth;
 use crate::expr::{BinaryOp, Expr, UnaryOp};
 use crate::types::{DataType, EngineError, Result, ScalarValue};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -41,7 +43,7 @@ fn jit_err<E: std::fmt::Display>(e: E) -> EngineError {
 
 /// True when `compile` accepts `expr`.
 pub fn supports(expr: &Expr) -> bool {
-    infer(expr, &mut Vec::new()).is_some()
+    check_depth(expr).is_ok() && infer(expr, &mut Vec::new()).is_some()
 }
 
 /// The type the kernel produces for `e`, or None when the JIT does not support it.
@@ -151,16 +153,56 @@ fn int_cc(op: BinaryOp) -> Option<IntCC> {
     })
 }
 
+/// Machine type of a kernel value in the two-row vector loop. Booleans are the I64X2 lane masks
+/// (all ones or zero) that `icmp`/`fcmp` produce; they are narrowed to 0/1 bytes at the store.
+fn clif_vector_type(dt: DataType) -> Type {
+    match dt {
+        DataType::Float64 => types::F64X2,
+        _ => types::I64X2,
+    }
+}
+
+/// Which loop `compile_with` emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codegen {
+    /// One row per iteration (the H1a kernel).
+    Scalar,
+    /// Two rows per iteration in I64X2/F64X2 registers, then the scalar loop for an odd last row.
+    /// aarch64 only: on other targets `compile_with` falls back to `Scalar`, because the vector
+    /// lowerings were only exercised on aarch64.
+    Vector,
+}
+
 struct Gen<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     bases: &'a [Value],
     mem: MemFlagsData,
     inputs: &'a [(usize, DataType)],
     offset: Value,
+    vector: bool,
 }
 
 impl Gen<'_, '_> {
-    /// Emits `e` for the current row and returns its SSA value with its logical type.
+    fn ty(&self, dt: DataType) -> Type {
+        if self.vector {
+            clif_vector_type(dt)
+        } else {
+            clif_type(dt)
+        }
+    }
+
+    /// A scalar constant, splatted to both lanes in vector mode.
+    fn constant(&mut self, scalar: Value, dt: DataType) -> Value {
+        if self.vector {
+            let ty = self.ty(dt);
+            self.b.ins().splat(ty, scalar)
+        } else {
+            scalar
+        }
+    }
+
+    /// Emits `e` for the current row (rows, in vector mode) and returns its SSA value with its
+    /// logical type.
     fn expr(&mut self, e: &Expr) -> Result<(Value, DataType)> {
         match e {
             Expr::Column { index, .. } => {
@@ -171,14 +213,17 @@ impl Gen<'_, '_> {
                     .ok_or_else(|| unsupported("jit: unknown input column"))?;
                 let (_, dt) = self.inputs[slot];
                 let addr = self.b.ins().iadd(self.bases[slot], self.offset);
-                let value = self.b.ins().load(clif_type(dt), self.mem, addr, 0);
+                let ty = self.ty(dt);
+                let value = self.b.ins().load(ty, self.mem, addr, 0);
                 Ok((value, dt))
             }
             Expr::Literal(ScalarValue::Int64(x)) => {
-                Ok((self.b.ins().iconst(types::I64, *x), DataType::Int64))
+                let s = self.b.ins().iconst(types::I64, *x);
+                Ok((self.constant(s, DataType::Int64), DataType::Int64))
             }
             Expr::Literal(ScalarValue::Float64(x)) => {
-                Ok((self.b.ins().f64const(*x), DataType::Float64))
+                let s = self.b.ins().f64const(*x);
+                Ok((self.constant(s, DataType::Float64), DataType::Float64))
             }
             Expr::Binary {
                 left, op, right, ..
@@ -211,10 +256,8 @@ impl Gen<'_, '_> {
                 if dt != DataType::Int64 {
                     return Err(unsupported("jit: cast source"));
                 }
-                Ok((
-                    self.b.ins().fcvt_from_sint(types::F64, v),
-                    DataType::Float64,
-                ))
+                let ty = self.ty(DataType::Float64);
+                Ok((self.b.ins().fcvt_from_sint(ty, v), DataType::Float64))
             }
             _ => Err(unsupported("jit: expression shape")),
         }
@@ -225,7 +268,8 @@ impl Gen<'_, '_> {
         if from == to {
             v
         } else {
-            self.b.ins().fcvt_from_sint(types::F64, v)
+            let ty = self.ty(to);
+            self.b.ins().fcvt_from_sint(ty, v)
         }
     }
 
@@ -257,8 +301,110 @@ impl Gen<'_, '_> {
     }
 }
 
+/// Compiles with the codegen `default_codegen` picks. See `compile_with` to force one.
 pub fn compile(expr: &Expr) -> Result<CompiledKernel> {
+    check_depth(expr)?; // `default_codegen` recurses too
+    compile_with(expr, default_codegen(expr))
+}
+
+/// Vector unless the expression has an Int64 multiply. aarch64 NEON has no 64-bit lane multiply;
+/// Cranelift emits a 7-instruction sequence per I64X2 `imul`, and with Int64 multiplies the
+/// vector loop lost or tied in docs/RESULTS-H1A-VEC.md, while every other expression gained >1.5x.
+/// Caller must have bounded the depth (`check_depth`).
+fn default_codegen(expr: &Expr) -> Codegen {
+    fn has_int_mul(e: &Expr) -> bool {
+        match e {
+            Expr::Binary {
+                left,
+                op,
+                right,
+                return_type,
+            } => {
+                (*op == BinaryOp::Mul && *return_type == DataType::Int64)
+                    || has_int_mul(left)
+                    || has_int_mul(right)
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => has_int_mul(expr),
+            _ => false,
+        }
+    }
+    if has_int_mul(expr) {
+        Codegen::Scalar
+    } else {
+        Codegen::Vector
+    }
+}
+
+/// Emits one loop iteration's body for `expr` at byte offset `offset` (row `i`) and stores it.
+/// Scalar: one row. Vector: rows `i` and `i + 1`.
+#[allow(clippy::too_many_arguments)]
+fn emit_row(
+    b: &mut FunctionBuilder<'_>,
+    expr: &Expr,
+    bases: &[Value],
+    inputs: &[(usize, DataType)],
+    out_type: DataType,
+    out: Value,
+    i: Value,
+    vector: bool,
+) -> Result<()> {
+    // Scalar accesses are 8-byte aligned (`Vec<i64>`/`Vec<f64>`) so `trusted()` holds. Vector
+    // accesses are 16 bytes on 8-byte-aligned buffers, so they must not claim `aligned`.
+    let mem = if vector {
+        MemFlagsData::new().with_notrap()
+    } else {
+        MemFlagsData::trusted()
+    };
+    // 8-byte slots for inputs and Int64/Float64 outputs; Boolean outputs are 1 byte per row.
+    let offset = b.ins().ishl_imm_u(i, 3);
+    let (value, dt) = Gen {
+        b,
+        bases,
+        mem,
+        inputs,
+        offset,
+        vector,
+    }
+    .expr(expr)?;
+    let want = if vector {
+        clif_vector_type(out_type)
+    } else {
+        clif_type(out_type)
+    };
+    // Checked here, not assumed, because the store width comes from the value's machine type.
+    if dt != out_type || b.func.dfg.value_type(value) != want {
+        return Err(unsupported("jit: output type"));
+    }
+    match (out_type, vector) {
+        (DataType::Boolean, false) => {
+            let dst = b.ins().iadd(out, i);
+            b.ins().store(mem, value, dst, 0);
+        }
+        (DataType::Boolean, true) => {
+            // Lane masks are all ones or zero; AND with 1 so each stored byte is exactly 0 or 1.
+            let one = b.ins().iconst(types::I64, 1);
+            let ones = b.ins().splat(types::I64X2, one);
+            let bits = b.ins().band(value, ones);
+            let dst = b.ins().iadd(out, i);
+            for lane in 0..2u8 {
+                let v = b.ins().extractlane(bits, lane);
+                b.ins().istore8(mem, v, dst, i32::from(lane));
+            }
+        }
+        _ => {
+            let dst = b.ins().iadd(out, offset);
+            b.ins().store(mem, value, dst, 0);
+        }
+    }
+    Ok(())
+}
+
+/// `compile` with an explicit loop shape. Both shapes have the same ABI and results.
+pub fn compile_with(expr: &Expr, codegen: Codegen) -> Result<CompiledKernel> {
     let start = Instant::now();
+    let vector = codegen == Codegen::Vector && cfg!(target_arch = "aarch64");
+    // `infer` and `Gen::expr` recurse once per level; bound them before either runs.
+    check_depth(expr)?;
     let mut inputs = Vec::new();
     let out_type =
         infer(expr, &mut inputs).ok_or_else(|| unsupported("jit: expression not supported"))?;
@@ -281,7 +427,6 @@ pub fn compile(expr: &Expr) -> Result<CompiledKernel> {
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
         // cranelift 0.138: load/store take MemFlagsData (MemFlags is now an interned handle).
-        let mem = MemFlagsData::trusted();
         let entry = b.create_block();
         let header = b.create_block();
         let body = b.create_block();
@@ -296,10 +441,32 @@ pub fn compile(expr: &Expr) -> Result<CompiledKernel> {
             b.block_params(entry)[2],
         );
         let bases: Vec<Value> = (0..inputs.len())
-            .map(|k| b.ins().load(ptr, mem, cols, (k * 8) as i32))
+            .map(|k| {
+                b.ins()
+                    .load(ptr, MemFlagsData::trusted(), cols, (k * 8) as i32)
+            })
             .collect();
         let zero = b.ins().iconst(ptr, 0);
-        b.ins().jump(header, &[zero.into()]);
+        if vector {
+            // Rows [0, n & !1) two at a time, then the scalar loop below for the last odd row.
+            let vheader = b.create_block();
+            let vbody = b.create_block();
+            b.append_block_param(vheader, ptr);
+            let n_even = b.ins().band_imm_s(n, -2);
+            b.ins().jump(vheader, &[zero.into()]);
+
+            b.switch_to_block(vheader);
+            let i = b.block_params(vheader)[0];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, i, n_even);
+            b.ins().brif(more, vbody, &[], header, &[i.into()]);
+
+            b.switch_to_block(vbody);
+            emit_row(&mut b, expr, &bases, &inputs, out_type, out, i, true)?;
+            let next = b.ins().iadd_imm_u(i, 2);
+            b.ins().jump(vheader, &[next.into()]);
+        } else {
+            b.ins().jump(header, &[zero.into()]);
+        }
 
         b.switch_to_block(header);
         let i = b.block_params(header)[0];
@@ -307,25 +474,7 @@ pub fn compile(expr: &Expr) -> Result<CompiledKernel> {
         b.ins().brif(more, body, &[], exit, &[]);
 
         b.switch_to_block(body);
-        // 8-byte slots for inputs and Int64/Float64 outputs; Boolean outputs are 1 byte per row.
-        let offset = b.ins().ishl_imm_u(i, 3);
-        let (value, dt) = Gen {
-            b: &mut b,
-            bases: &bases,
-            mem,
-            inputs: &inputs,
-            offset,
-        }
-        .expr(expr)?;
-        // Checked here, not assumed, because the store width comes from the value's machine type.
-        if dt != out_type || b.func.dfg.value_type(value) != clif_type(out_type) {
-            return Err(unsupported("jit: output type"));
-        }
-        let dst = match out_type {
-            DataType::Boolean => b.ins().iadd(out, i),
-            _ => b.ins().iadd(out, offset),
-        };
-        b.ins().store(mem, value, dst, 0);
+        emit_row(&mut b, expr, &bases, &inputs, out_type, out, i, false)?;
         let next = b.ins().iadd_imm_u(i, 1);
         b.ins().jump(header, &[next.into()]);
 
@@ -432,8 +581,10 @@ impl CompiledKernel {
     /// `self.out_type` (8 bytes per row for Int64/Float64, 1 byte per row for Boolean).
     fn invoke(&self, ptrs: &[*const u8], n: usize, out: *mut u8) {
         // SAFETY: `run` establishes the contract above (input lengths checked against
-        // `batch.num_rows`, output sized per type). The kernel reads and writes rows 0..n only.
-        // Boolean rows receive only the i8 values 0 or 1 from icmp/fcmp, so each byte is a valid bool.
+        // `batch.num_rows`, output sized per type). The kernel reads and writes rows 0..n only:
+        // the vector loop covers rows below `n & !1` two at a time, the scalar loop the rest.
+        // Boolean rows receive only 0 or 1: scalar icmp/fcmp yield an i8 0/1, and the vector loop
+        // ANDs each lane mask with 1 before its byte store, so each byte is a valid bool.
         unsafe { (self.func)(ptrs.as_ptr(), n, out) };
     }
 }
@@ -544,7 +695,13 @@ mod tests {
     /// rows the same value (Float64 compared by bits, so NaN payloads and -0.0 count).
     fn assert_matches_eval(e: &Expr, batch: &Batch) {
         assert!(supports(e), "supports must accept {e:?}");
-        let jit = compile(e).unwrap().run(batch).unwrap();
+        for codegen in [Codegen::Scalar, Codegen::Vector] {
+            assert_codegen_matches_eval(e, batch, codegen);
+        }
+    }
+
+    fn assert_codegen_matches_eval(e: &Expr, batch: &Batch, codegen: Codegen) {
+        let jit = compile_with(e, codegen).unwrap().run(batch).unwrap();
         let reference = eval(e, batch).unwrap();
         assert_eq!(jit.data_type(), reference.data_type());
         assert_eq!(jit.len(), reference.len());
@@ -1031,6 +1188,136 @@ mod tests {
         }
         // Sanity: the same builders with supported operands do compile.
         assert!(supports(&bin(i(), BinaryOp::Add, c(&s, "f"))));
+    }
+
+    #[test]
+    fn compile_vectorizes_unless_there_is_an_int64_multiply() {
+        let (s, _) = setup(vec![
+            ("a", Column::from_i64(vec![1])),
+            ("x", Column::from_f64(vec![1.0])),
+        ]);
+        let vector = [
+            bin(c(&s, "a"), BinaryOp::Add, lit_i(2)),
+            bin(c(&s, "x"), BinaryOp::Mul, c(&s, "x")),
+            // Int64 * Float64 promotes to a Float64 multiply.
+            bin(c(&s, "a"), BinaryOp::Mul, c(&s, "x")),
+            bin(neg(c(&s, "a")), BinaryOp::Lt, c(&s, "a")),
+        ];
+        for e in &vector {
+            assert_eq!(default_codegen(e), Codegen::Vector, "{e:?}");
+        }
+        let scalar = [
+            bin(c(&s, "a"), BinaryOp::Mul, lit_i(2)),
+            neg(bin(c(&s, "a"), BinaryOp::Mul, c(&s, "a"))),
+            bin(
+                cast(
+                    bin(c(&s, "a"), BinaryOp::Mul, c(&s, "a")),
+                    DataType::Float64,
+                )
+                .unwrap(),
+                BinaryOp::Gt,
+                c(&s, "x"),
+            ),
+        ];
+        for e in &scalar {
+            assert_eq!(default_codegen(e), Codegen::Scalar, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn vector_boolean_output_bytes_are_zero_or_one_and_stay_in_bounds() {
+        // Raw bytes, not `Vec<bool>`: a stored 0xFF would already be UB as a bool.
+        for n in [0usize, 1, 2, 3, 7, 8] {
+            let a: Vec<i64> = (0..n as i64).map(|x| x - 3).collect();
+            let f: Vec<f64> = (0..n).map(|x| x as f64 - 3.5).collect();
+            let (s, _) = setup(vec![
+                ("a", Column::from_i64(a.clone())),
+                ("f", Column::from_f64(f.clone())),
+            ]);
+            let cases = [
+                bin(c(&s, "a"), BinaryOp::Lt, lit_i(0)),
+                bin(c(&s, "f"), BinaryOp::GtEq, lit_f(0.0)),
+            ];
+            for e in &cases {
+                let k = compile_with(e, Codegen::Vector).unwrap();
+                let ptrs: Vec<*const u8> = k
+                    .inputs
+                    .iter()
+                    .map(|&(ci, _)| match ci {
+                        0 => a.as_ptr().cast(),
+                        _ => f.as_ptr().cast(),
+                    })
+                    .collect();
+                let mut out = vec![0xAAu8; n + 4];
+                k.invoke(&ptrs, n, out.as_mut_ptr());
+                assert!(out[..n].iter().all(|&x| x <= 1), "n={n}: {out:?}");
+                assert!(
+                    out[n..].iter().all(|&x| x == 0xAA),
+                    "n={n} overrun: {out:?}"
+                );
+                let want: Vec<u8> = match k.inputs[0].0 {
+                    0 => a.iter().map(|&x| u8::from(x < 0)).collect(),
+                    _ => f.iter().map(|&x| u8::from(x >= 0.0)).collect(),
+                };
+                assert_eq!(&out[..n], &want[..], "n={n}");
+            }
+        }
+    }
+
+    /// Left-deep `a + 1 + 1 + ...` with `depth` levels, built without recursion.
+    fn chain(s: &Schema, depth: usize) -> Expr {
+        let mut e = c(s, "a");
+        for _ in 1..depth {
+            e = bin(e, BinaryOp::Add, lit_i(1));
+        }
+        e
+    }
+
+    /// The derived Drop recurses once per level, so a 100k-deep tree is torn down by hand.
+    fn dismantle(mut e: Expr) {
+        while let Expr::Binary { left, .. } = e {
+            e = *left;
+        }
+    }
+
+    #[test]
+    fn deep_expressions_are_rejected_not_aborted() {
+        use crate::eval::{eval_predicate, MAX_EXPR_DEPTH};
+        // Runs on the default 2 MiB test-thread stack (in debug builds too), so the depth that is
+        // still accepted proves the limit is safe for both `compile` and `eval`.
+        let (s, batch) = setup(vec![("a", Column::from_i64(vec![1, 2, 3]))]);
+        let at_limit = chain(&s, MAX_EXPR_DEPTH);
+        assert_eq!(at_limit.depth(), MAX_EXPR_DEPTH);
+        assert_matches_eval(&at_limit, &batch);
+        let pred = bin(at_limit, BinaryOp::Gt, lit_i(0));
+        assert!(matches!(
+            eval_predicate(&pred, &batch),
+            Err(EngineError::Plan(_))
+        ));
+        assert!(!supports(&pred));
+        assert!(matches!(compile(&pred), Err(EngineError::Plan(_))));
+        dismantle(pred);
+
+        // Other node kinds at the limit: Neg (JIT and eval) and nested CASE (eval only).
+        let mut negs = c(&s, "a");
+        for _ in 1..MAX_EXPR_DEPTH {
+            negs = neg(negs);
+        }
+        assert_matches_eval(&negs, &batch);
+        let mut cases = c(&s, "a");
+        // The condition has depth 2, so 126 wraps reach depth 128.
+        for _ in 2..MAX_EXPR_DEPTH {
+            let cond = bin(c(&s, "a"), BinaryOp::Gt, lit_i(1));
+            cases = case(cond, c(&s, "a"), cases).unwrap();
+        }
+        assert_eq!(cases.depth(), MAX_EXPR_DEPTH);
+        assert!(eval(&cases, &batch).is_ok());
+
+        let deep = chain(&s, 100_000);
+        assert!(!supports(&deep));
+        assert!(matches!(compile(&deep), Err(EngineError::Plan(_))));
+        assert!(matches!(eval(&deep, &batch), Err(EngineError::Plan(_))));
+        dismantle(deep);
     }
 
     #[test]

@@ -83,6 +83,7 @@ pub fn case(c: Expr, t: Expr, e: Expr) -> Result<Expr> {
 
 /// Evaluate over every row of `batch`; result length == batch.num_rows.
 pub fn eval(expr: &Expr, batch: &Batch) -> Result<Column> {
+    check_depth(expr)?;
     eval_ref(expr, batch).map(Cow::into_owned)
 }
 
@@ -215,12 +216,54 @@ fn eval_ref<'a>(expr: &Expr, batch: &'a Batch) -> Result<Cow<'a, Column>> {
 
 /// Boolean predicate -> row mask; NULL counts as false (SQL WHERE semantics).
 pub fn eval_predicate(expr: &Expr, batch: &Batch) -> Result<Vec<bool>> {
+    check_depth(expr)?;
     let c = eval_ref(expr, batch)?;
     let b = as_bools(&c)?;
     Ok(b.iter()
         .enumerate()
         .map(|(i, &v)| v && c.is_valid(i))
         .collect())
+}
+
+/// Deepest expression `eval`, `eval_predicate` and `jit::compile` accept. They recurse once per
+/// level, so without a bound a deep enough tree overflows the stack and aborts the process.
+/// Sized for the worst case measured on a 2 MiB thread stack (aarch64): a debug-build `eval_ref`
+/// frame is ~11 KiB and overflowed between depth 180 and 200; release `eval` and debug `compile`
+/// survived 1000. `deep_expressions_are_rejected_not_aborted` checks this depth still runs.
+pub const MAX_EXPR_DEPTH: usize = 128;
+
+/// `EngineError::Plan` when `expr` nests deeper than `MAX_EXPR_DEPTH` (a leaf has depth 1).
+/// Stops descending at the limit, so the check's own recursion is bounded too.
+pub fn check_depth(expr: &Expr) -> Result<()> {
+    fn exceeds(e: &Expr, budget: usize) -> bool {
+        let Some(budget) = budget.checked_sub(1) else {
+            return true;
+        };
+        match e {
+            Expr::Column { .. } | Expr::Literal(_) => false,
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => exceeds(expr, budget),
+            Expr::Binary { left, right, .. } => exceeds(left, budget) || exceeds(right, budget),
+            Expr::InList { expr, list, .. } => {
+                exceeds(expr, budget) || list.iter().any(|x| exceeds(x, budget))
+            }
+            Expr::Case {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                exceeds(condition, budget)
+                    || exceeds(then_expr, budget)
+                    || exceeds(else_expr, budget)
+            }
+        }
+    }
+    if exceeds(expr, MAX_EXPR_DEPTH) {
+        return Err(EngineError::Plan(format!(
+            "expression nests deeper than {MAX_EXPR_DEPTH} levels"
+        )));
+    }
+    Ok(())
 }
 
 /// Constant folding / algebraic simplification (x+0, x*1, true AND x, literal-only subtrees).
