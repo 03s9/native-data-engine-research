@@ -1,8 +1,10 @@
 # Resultado — JIT vetorial (I64X2/F64X2) × JIT escalar × avaliador
 
 **Veredito.** A hipótese se sustenta, com uma exceção. Gerar um laço de duas linhas por iteração em registradores
-`I64X2`/`F64X2` (mais um laço escalar para a última linha ímpar) baixou `t_jit` de ~0,55 para ~0,29 ns por tupla
+`I64X2`/`F64X2` (mais um laço escalar para a última linha ímpar) baixou `t_jit` de ~0,52–0,63 para ~0,26–0,38 ns por tupla
 em todas as expressões **sem multiplicação Int64**: de 1,52x a 1,99x sobre o JIT escalar, em 200k e 1M, nas duas execuções.
+Não está provado que o ganho venha do SIMD: o laço vetorial também faz metade das iterações, e o laço escalar do Cranelift
+paga dois desvios por iteração. Um laço escalar desenrolado em duas linhas separaria os dois efeitos e não foi testado.
 Com multiplicação Int64 o resultado depende de quantas há: uma só (`mul2`) ganha 1,8–2,0x, duas empatam ou perdem
 (`arith4` 1,08–1,10x, `cmp` 0,91–0,94x), quatro perdem (`arith8` 0,62–0,65x).
 A regra registrada antes das execuções completas foi cumprida, e `compile` agora vetoriza toda expressão sem `Mul` Int64.
@@ -21,7 +23,7 @@ Fixada depois de uma execução `--quick` exploratória (ganho sem `Mul` Int64, 
   (acima do ruído de ~8% do JIT) em 200k **e** 1M, **nas duas** execuções. Senão o padrão fica `Scalar`.
 - A política foi ajustada sobre este mesmo conjunto de expressões; não há conjunto de validação separado.
 
-**Resultado da regra:** cumprida. O menor ganho entre as vetorizadas foi 1,52x (`add4`, 1M, execução 1); `cmp_add` e `fcmp`
+**Resultado da regra:** cumprida. O menor ganho entre as vetorizadas foi 1,52x (`add4`, 200k, execução 1); `cmp_add` e `fcmp`
 ganharam, então Boolean entrou. Commit `256cb2a`. A política deixa ganho na mesa: `mul2` (um `Mul` Int64) ganharia ~1,9x
 vetorizado, mas fica escalar. A política não foi refinada depois de ver isso, para não ajustar a regra aos dados duas vezes.
 
@@ -55,21 +57,23 @@ Todos os números são deste processo; nada vem do CSV de H1a.
 
 Kernel escolhido: vetorial em todas exceto `arith4`, `arith8`, `cmp` e `mul2` (escalar). `T_comp` = mediana de 30 compilações a quente.
 "Ponta a ponta" = compilar + executar + liberar o kernel contra `eval`, numa única região cronometrada.
+Esta tabela é montada a partir dos braços explícitos `jit`/`jitv` (binário compilado em `dfe3861`, antes da troca do padrão);
+não houve um braço medido chamando `compile()`. O cruzamento no modelo é `T_comp / (t_vec − t_kernel)`.
 
 | Expressão | Kernel | `T_comp` (µs) | Speedup em 200k | Speedup em 1M | Cruzamento no modelo (taxas de 200k) | Ponta a ponta em 200k | Ponta a ponta em 1M |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `add2` | vetorial | 85 / 76 | 0,70x / 0,69x | 0,70x / 0,58x | nenhum | vetorizado | vetorizado |
-| `add4` | vetorial | 65 / 70 | 1,64x / 1,67x | 1,66x / 1,69x | 264k / 289k | vetorizado | JIT |
+| `add2` | vetorial | 85 / 76 | 0,70x / 0,69x | 0,70x / 0,58x | nenhum | avaliador | avaliador |
+| `add4` | vetorial | 65 / 70 | 1,64x / 1,67x | 1,66x / 1,69x | 264k / 289k | avaliador | JIT |
 | `add8` | vetorial | 84 / 81 | 3,44x / 3,87x | 3,85x / 3,98x | 100k / 75k | JIT | JIT |
-| `arith4` | escalar | 49 / 51 | 1,40x / 1,47x | 1,46x / 1,53x | 203k / 179k | vetorizado | JIT |
+| `arith4` | escalar | 49 / 51 | 1,40x / 1,47x | 1,46x / 1,53x | 203k / 179k | avaliador | JIT |
 | `arith8` | escalar | 55 / 53 | 2,53x / 2,56x | 2,74x / 2,68x | 53k / 50k | JIT | JIT |
-| `float4` | vetorial | 60 / 64 | 2,04x / 1,84x | 2,18x / 2,05x | 191k / 258k | vetorizado | JIT |
+| `float4` | vetorial | 60 / 64 | 2,04x / 1,84x | 2,18x / 2,05x | 191k / 258k | avaliador | JIT |
 | `float8` | vetorial | 78 / 76 | 4,13x / 4,41x | 4,48x / 4,48x | 82k / 75k | JIT | JIT |
-| `mixed` | vetorial | 66 / 61 | 1,71x / 1,71x | 1,74x / 1,77x | 288k / 267k | vetorizado | JIT |
-| `cmp` | escalar | 49 / 48 | 1,49x / 1,39x | 1,43x / 1,43x | 174k / 208k | vetorizado | JIT |
-| `cmp_add` | vetorial | 75 / 74 | 1,79x / 1,57x | 1,85x / 1,75x | 308k / 420k | vetorizado | JIT |
-| `fcmp` | vetorial | 67 / 68 | 2,04x / 1,75x | 2,12x / 2,13x | 232k / 350k | vetorizado | JIT |
-| `mul2` | escalar | 44 / 36 | 0,50x / 0,51x | 0,50x / 0,49x | nenhum | vetorizado | vetorizado |
+| `mixed` | vetorial | 66 / 61 | 1,71x / 1,71x | 1,74x / 1,77x | 288k / 267k | avaliador | JIT |
+| `cmp` | escalar | 49 / 48 | 1,49x / 1,39x | 1,43x / 1,43x | 174k / 208k | avaliador | JIT |
+| `cmp_add` | vetorial | 75 / 74 | 1,79x / 1,57x | 1,85x / 1,75x | 308k / 420k | avaliador | JIT |
+| `fcmp` | vetorial | 67 / 68 | 2,04x / 1,75x | 2,12x / 2,13x | 232k / 350k | avaliador | JIT |
+| `mul2` | escalar | 44 / 36 | 0,50x / 0,51x | 0,50x / 0,49x | nenhum | avaliador | avaliador |
 
 Efeito sobre os critérios de H1a (RFC-0001 §7.2): com a política, as oito expressões originais de ECI ≥ 4 passam no speedup
 ≥ 1,3x em 200k e 1M nas duas execuções. Em H1a, três delas falhavam: `add4`, `float4` e `mixed`.
@@ -79,9 +83,11 @@ Ponta a ponta, o JIT ganha em 200k nas mesmas três de antes (`add8`, `arith8`, 
 
 ## O que explica os números
 
-- **O piso caiu pela metade, não por operação.** O laço vetorial custa ~0,26–0,32 ns por tupla, ou ~0,55–0,6 ns por iteração
-  de duas linhas, praticamente o mesmo custo por iteração do laço escalar. Isso vale de 1 a 7 operadores sem `Mul` Int64:
-  `float8` (7 operadores) custa o mesmo que `add2`. Então o piso de ~0,55 ns do H1a é custo **por iteração**, não por operação.
+- **O piso caiu quase pela metade.** O laço vetorial custa ~0,26–0,32 ns por tupla (~0,55–0,65 ns por iteração de duas linhas,
+  perto do custo por iteração do laço escalar) em `add2`, `float4`, `float8`, `mixed`, `cmp_add` e `fcmp`, e ~0,36–0,38 ns em
+  `add4` e `add8`. O número de operadores pesa pouco: `float8` (7 operadores) custa o mesmo que `add2`, mas `add4` (3) custa mais
+  que `float8`. `add4` e `add8` são as únicas que leem quatro colunas; tráfego de memória é uma causa plausível, não testada.
+  Leitura: a maior parte do piso de ~0,55 ns do H1a é custo por iteração, não por operação.
 - **Causa provável do piso (inferida, não medida com contadores):** o disassembly do Cranelift (`Context::set_disasm`)
   mostra que o laço escalar faz dois desvios tomados por linha: o teste fica no topo (`subs` + `b.lo` para o corpo) e o corpo
   termina com um `b` incondicional de volta ao teste. O Cranelift não rotaciona o laço. Exemplo de `a+b`:
@@ -94,18 +100,20 @@ Ponta a ponta, o JIT ganha em 200k nas mesmas três de antes (`add8`, `arith8`, 
   O escalar usa um só `madd`. Com um `Mul` (`mul2`) a sequência ainda cabe na folga do laço e o vetorial ganha 1,9x;
   com duas empata ou perde; com quatro (`arith8`) perde 0,63x. Leitura: as sequências de 7 instruções passam a dominar
   a iteração assim que há mais de uma. É uma inferência a partir dos tempos; não houve profiler.
-- **Saída Boolean.** As comparações vetoriais (`cmeq`/`cmgt`/`fcmgt` em `.2d`) produzem máscaras de lanes; o kernel faz AND com 1
-  e grava dois bytes (`mov x, v.d[0]`, `strb`, `mov x, v.d[1]`, `strb`). Mesmo assim `cmp_add` e `fcmp` ganharam ~1,9x,
-  então a perda de `cmp` vem das multiplicações, não do caminho Boolean.
-- **Literais:** o `splat` sai do laço (é içado pelo Cranelift; visto no disassembly de uma comparação com literal).
+- **Saída Boolean.** As comparações vetoriais produzem máscaras de lanes (no disassembly de `a = b` Int64: `cmeq v0.2d`; as
+  demais comparações não foram inspecionadas); o kernel faz AND com 1 e grava dois bytes (`mov x, v.d[0]`, `strb`, `mov x, v.d[1]`,
+  `strb`). Mesmo assim `cmp_add` e `fcmp` ganharam ~1,9x, então a perda de `cmp` vem das multiplicações, não do caminho Boolean.
+- **Constantes splat:** a máscara `splat(1)` da saída Boolean fica fora do laço (registrador `v25` carregado antes, visto no
+  disassembly). Não verifiquei o mesmo para os literais das expressões.
 
 ## Correção
 
 - `engine/tests/jit_diff.rs` agora roda cada caso pelos dois codegens e inclui o tamanho 3 (tamanhos 0, 1, 2, 3, 7, 8, 9, 63,
   64, 65, 8191, 8192, 8193): 7 800 casos por codegen, 0 divergências em ambos.
-- Linhas em que os dois lados dão NaN com bits diferentes: **0** nesta execução (escalar e vetorial). `RESULTS-H1A.md` relatou
-  49 590 linhas em 22 casos. A diferença não foi explicada. Hipótese não verificada: acrescentar o tamanho 3 mudou a sequência
-  do gerador aleatório e, com ela, as expressões sorteadas.
+- Linhas em que os dois lados dão NaN com bits diferentes: **0** com os tamanhos atuais, nos dois codegens. `RESULTS-H1A.md` relatou
+  49 590 linhas em 22 casos. Explicação verificada: acrescentar o tamanho 3 muda a sequência do gerador e as expressões sorteadas.
+  Tirando o 3 temporariamente, voltam 49 590 linhas em 22 casos (debug), iguais no escalar e no vetorial; em release são 57 319
+  linhas em 63 casos, também iguais nos dois. A causa da diferença de bits do NaN continua não investigada.
 - Testes unitários novos em `jit.rs`: toda expressão suportada é comparada com `eval` nos dois codegens; bytes de saída Boolean
   do kernel vetorial são exatamente 0 ou 1 e nada é escrito além de `n` (n = 0, 1, 2, 3, 7, 8, lidos como `u8` crus);
   e a escolha de codegen da política padrão.
