@@ -364,6 +364,11 @@ fn expression_set(s: &Schema) -> EResult<Vec<(&'static str, Expr)>> {
     );
     let mixed = op(op(cast(a()?, DataType::Float64), Mul, x()), Add, y());
     let cmp = op(op(op(a(), Add, b()), Mul, c()), Gt, op(d(), Mul, int(1000)));
+    // Added for the vector-JIT run (docs/RESULTS-H1A-VEC.md): separate the Boolean store path
+    // and the Int64 multiply from each other.
+    let cmp_add = op(op(a(), Add, b()), Gt, op(c(), Add, d()));
+    let fcmp = op(op(x(), Mul, y()), Gt, op(x(), Sub, y()));
+    let mul2 = op(a(), Mul, b());
 
     [
         ("add2", add2),
@@ -375,6 +380,9 @@ fn expression_set(s: &Schema) -> EResult<Vec<(&'static str, Expr)>> {
         ("float8", float8),
         ("mixed", mixed),
         ("cmp", cmp),
+        ("cmp_add", cmp_add),
+        ("fcmp", fcmp),
+        ("mul2", mul2),
     ]
     .into_iter()
     .map(|(name, e)| e.map(|e| (name, e)))
@@ -699,6 +707,9 @@ fn main() -> BoxResult<()> {
         std::thread::available_parallelism().map_or(0, |n| n.get())
     );
     println!("Build: release (debug_assertions off)");
+    if !cfg!(target_arch = "aarch64") {
+        println!("WARNING: not aarch64, Codegen::Vector falls back to scalar; jitv rows measure the scalar kernel");
+    }
     println!(
         "Timer: smallest nonzero Instant gap = {} ns",
         timer_gap_ns()
