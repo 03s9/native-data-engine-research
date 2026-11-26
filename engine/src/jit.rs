@@ -6,6 +6,7 @@
 //! `out` at the output values (8 bytes per row for Int64/Float64, 1 byte per row for Boolean).
 //! NULLs are handled outside the kernel: output validity = AND of the input validities.
 use crate::column::{Batch, Column, Values};
+use crate::eval::check_depth;
 use crate::expr::{BinaryOp, Expr, UnaryOp};
 use crate::types::{DataType, EngineError, Result, ScalarValue};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -41,7 +42,7 @@ fn jit_err<E: std::fmt::Display>(e: E) -> EngineError {
 
 /// True when `compile` accepts `expr`.
 pub fn supports(expr: &Expr) -> bool {
-    infer(expr, &mut Vec::new()).is_some()
+    check_depth(expr).is_ok() && infer(expr, &mut Vec::new()).is_some()
 }
 
 /// The type the kernel produces for `e`, or None when the JIT does not support it.
@@ -259,6 +260,8 @@ impl Gen<'_, '_> {
 
 pub fn compile(expr: &Expr) -> Result<CompiledKernel> {
     let start = Instant::now();
+    // `infer` and `Gen::expr` recurse once per level; bound them before either runs.
+    check_depth(expr)?;
     let mut inputs = Vec::new();
     let out_type =
         infer(expr, &mut inputs).ok_or_else(|| unsupported("jit: expression not supported"))?;
@@ -1031,6 +1034,47 @@ mod tests {
         }
         // Sanity: the same builders with supported operands do compile.
         assert!(supports(&bin(i(), BinaryOp::Add, c(&s, "f"))));
+    }
+
+    /// Left-deep `a + 1 + 1 + ...` with `depth` levels, built without recursion.
+    fn chain(s: &Schema, depth: usize) -> Expr {
+        let mut e = c(s, "a");
+        for _ in 1..depth {
+            e = bin(e, BinaryOp::Add, lit_i(1));
+        }
+        e
+    }
+
+    /// The derived Drop recurses once per level, so a 100k-deep tree is torn down by hand.
+    fn dismantle(mut e: Expr) {
+        while let Expr::Binary { left, .. } = e {
+            e = *left;
+        }
+    }
+
+    #[test]
+    fn deep_expressions_are_rejected_not_aborted() {
+        use crate::eval::{eval_predicate, MAX_EXPR_DEPTH};
+        // Runs on the default 2 MiB test-thread stack (in debug builds too), so the depth that is
+        // still accepted proves the limit is safe for both `compile` and `eval`.
+        let (s, batch) = setup(vec![("a", Column::from_i64(vec![1, 2, 3]))]);
+        let at_limit = chain(&s, MAX_EXPR_DEPTH);
+        assert_eq!(at_limit.depth(), MAX_EXPR_DEPTH);
+        assert_matches_eval(&at_limit, &batch);
+        let pred = bin(at_limit, BinaryOp::Gt, lit_i(0));
+        assert!(matches!(
+            eval_predicate(&pred, &batch),
+            Err(EngineError::Plan(_))
+        ));
+        assert!(!supports(&pred));
+        assert!(matches!(compile(&pred), Err(EngineError::Plan(_))));
+        dismantle(pred);
+
+        let deep = chain(&s, 100_000);
+        assert!(!supports(&deep));
+        assert!(matches!(compile(&deep), Err(EngineError::Plan(_))));
+        assert!(matches!(eval(&deep, &batch), Err(EngineError::Plan(_))));
+        dismantle(deep);
     }
 
     #[test]
