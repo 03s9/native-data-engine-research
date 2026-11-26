@@ -11,14 +11,16 @@
 //! - Outputs leave the timed region and are dropped after the clock stops. Where a region runs K
 //!   calls back to back (K calibrated so a region lasts about 1 ms), intermediate outputs are
 //!   dropped inside the region on both sides, so the cost is symmetric.
-//! - Vectorized and JIT regions alternate within each iteration.
+//! - Vectorized, scalar-JIT and vector-JIT regions alternate within each iteration.
+//! - "jit" is always `jit::Codegen::Scalar` (the H1a kernel) and "jitv" is `jit::Codegen::Vector`
+//!   (two rows per iteration, I64X2/F64X2), whatever `jit::DEFAULT_CODEGEN` is.
 //! - Before any timing, outputs are compared row by row (valid rows; the data has no nulls).
 
 use native_engine::column::{schema_ref, Batch, Column, Values};
 use native_engine::cost::{crossover, eci, CostParams};
 use native_engine::eval::{binary, cast, col, eval, lit};
 use native_engine::expr::{BinaryOp, Expr};
-use native_engine::jit;
+use native_engine::jit::{self, Codegen};
 use native_engine::types::{DataType, Field, ScalarValue, Schema, SchemaRef};
 use std::error::Error;
 use std::hint::black_box;
@@ -112,8 +114,10 @@ struct NResult {
     n: usize,
     vec: Stats,
     jit: Stats,
+    jitv: Stats,
     e2e_vec: Stats,
     e2e_jit: Stats,
+    e2e_jitv: Stats,
 }
 
 struct ExprResult {
@@ -121,6 +125,7 @@ struct ExprResult {
     eci: f64,
     supported: bool,
     tcomp: Option<Stats>,
+    tcomp_v: Option<Stats>,
     per_n: Vec<NResult>,
 }
 
@@ -250,9 +255,9 @@ fn time_region(k: usize, n: usize, f: &mut dyn FnMut() -> EResult<Column>) -> Bo
 }
 
 /// Wall-clock compile time (kernel dropped outside the clock), plus the kernel's own `compile_time`.
-fn compile_timed(expr: &Expr) -> BoxResult<(f64, f64)> {
+fn compile_timed(expr: &Expr, codegen: Codegen) -> BoxResult<(f64, f64)> {
     let start = Instant::now();
-    let kernel = jit::compile(black_box(expr))?;
+    let kernel = jit::compile_with(black_box(expr), codegen)?;
     let wall = start.elapsed().as_nanos() as f64;
     let internal = kernel.compile_time.as_nanos() as f64;
     drop(kernel);
@@ -398,85 +403,114 @@ fn run_expr(
             eci: e,
             supported,
             tcomp: None,
+            tcomp_v: None,
             per_n: Vec::new(),
         });
     }
 
-    let (cold, _) = compile_timed(expr)?;
-    println!(
-        "  first compile (cold, excluded from stats): {:.1} us",
-        cold / 1e3
-    );
-    let mut comp = Vec::new();
-    for r in 0..plan.comp_runs() {
-        let (wall, internal) = compile_timed(expr)?;
-        comp.push(wall);
-        push(rows, name, e, "t_comp_ns", 0, r, wall);
-        push(rows, name, e, "compile_internal_ns", 0, r, internal);
+    let mut tcs = Vec::new();
+    for (codegen, label, m_wall, m_internal) in [
+        (Codegen::Scalar, "jit ", "t_comp_ns", "compile_internal_ns"),
+        (
+            Codegen::Vector,
+            "jitv",
+            "jitv_t_comp_ns",
+            "jitv_compile_internal_ns",
+        ),
+    ] {
+        let (cold, _) = compile_timed(expr, codegen)?;
+        let mut comp = Vec::new();
+        for r in 0..plan.comp_runs() {
+            let (wall, internal) = compile_timed(expr, codegen)?;
+            comp.push(wall);
+            push(rows, name, e, m_wall, 0, r, wall);
+            push(rows, name, e, m_internal, 0, r, internal);
+        }
+        let tc = stats(&mut comp);
+        println!(
+            "  {label} first compile (excluded) {:.1} us | T_comp us ({} compiles): min {:.1}  median {:.1}  p90 {:.1}",
+            cold / 1e3,
+            plan.comp_runs(),
+            tc.min / 1e3,
+            tc.median / 1e3,
+            tc.p90 / 1e3
+        );
+        tcs.push(tc);
     }
-    let tc = stats(&mut comp);
-    println!(
-        "  T_comp us ({} compiles): min {:.1}  median {:.1}  p90 {:.1}",
-        plan.comp_runs(),
-        tc.min / 1e3,
-        tc.median / 1e3,
-        tc.p90 / 1e3
-    );
+    let (tc, tc_v) = (tcs[0], tcs[1]);
 
     let mut per_n = Vec::new();
     for &n in plan.grid() {
         let batch = gen_batch(n, sch)?;
-        let kernel = jit::compile(expr)?;
+        let kernel = jit::compile_with(expr, Codegen::Scalar)?;
+        let kernel_v = jit::compile_with(expr, Codegen::Vector)?;
         let out_vec = eval(expr, &batch)?;
-        let out_jit = kernel.run(&batch)?;
-        same_column(&out_vec, &out_jit)
-            .map_err(|m| format!("{name} N={n}: JIT output differs from eval: {m}"))?;
+        for (label, k) in [("scalar", &kernel), ("vector", &kernel_v)] {
+            same_column(&out_vec, &k.run(&batch)?)
+                .map_err(|m| format!("{name} N={n}: {label} JIT output differs from eval: {m}"))?;
+        }
         drop(out_vec);
-        drop(out_jit);
 
         let mut run_vec = || eval(black_box(expr), black_box(&batch));
         let mut run_jit = || kernel.run(black_box(&batch));
-        let mut e2e_jit = || -> EResult<Column> {
-            let k = jit::compile(black_box(expr))?;
-            let c = k.run(black_box(&batch))?;
-            drop(k);
-            Ok(c)
+        let mut run_jitv = || kernel_v.run(black_box(&batch));
+        let e2e = |codegen: Codegen| {
+            let batch = &batch;
+            move || -> EResult<Column> {
+                let k = jit::compile_with(black_box(expr), codegen)?;
+                let c = k.run(black_box(batch))?;
+                drop(k);
+                Ok(c)
+            }
         };
+        let mut e2e_jit = e2e(Codegen::Scalar);
+        let mut e2e_jitv = e2e(Codegen::Vector);
 
-        // Calibrate K so one region lasts about 1 ms on the faster side.
+        // Calibrate K so one region lasts about 1 ms on the fastest side.
         let w_vec = time_region(1, n, &mut run_vec)?;
         let w_jit = time_region(1, n, &mut run_jit)?;
-        let k = ((MIN_REGION_NS / w_vec.min(w_jit).max(1.0)).ceil() as usize).clamp(1, 1_000_000);
+        let w_jitv = time_region(1, n, &mut run_jitv)?;
+        let fastest = w_vec.min(w_jit).min(w_jitv).max(1.0);
+        let k = ((MIN_REGION_NS / fastest).ceil() as usize).clamp(1, 1_000_000);
 
-        let (mut vs, mut js) = (Vec::new(), Vec::new());
+        let (mut vs, mut js, mut jvs) = (Vec::new(), Vec::new(), Vec::new());
         for r in 0..plan.runs() {
             let tv = time_region(k, n, &mut run_vec)?;
             let tj = time_region(k, n, &mut run_jit)?;
+            let tjv = time_region(k, n, &mut run_jitv)?;
             push(rows, name, e, "vec_call_ns", n, r, tv);
             push(rows, name, e, "jit_call_ns", n, r, tj);
+            push(rows, name, e, "jitv_call_ns", n, r, tjv);
             vs.push(tv / n as f64);
             js.push(tj / n as f64);
+            jvs.push(tjv / n as f64);
         }
 
-        // Warm-up for the end-to-end regions (untimed), then alternate vec and jit.
+        // Warm-up for the end-to-end regions (untimed), then alternate vec, jit and jitv.
         time_region(1, n, &mut run_vec)?;
         time_region(1, n, &mut e2e_jit)?;
-        let (mut evs, mut ejs) = (Vec::new(), Vec::new());
+        time_region(1, n, &mut e2e_jitv)?;
+        let (mut evs, mut ejs, mut ejvs) = (Vec::new(), Vec::new(), Vec::new());
         for r in 0..plan.e2e_runs() {
             let tv = time_region(k, n, &mut run_vec)?;
             let tj = time_region(k, n, &mut e2e_jit)?;
+            let tjv = time_region(k, n, &mut e2e_jitv)?;
             push(rows, name, e, "e2e_vec_call_ns", n, r, tv);
             push(rows, name, e, "e2e_jit_call_ns", n, r, tj);
+            push(rows, name, e, "e2e_jitv_call_ns", n, r, tjv);
             evs.push(tv);
             ejs.push(tj);
+            ejvs.push(tjv);
         }
 
         let res = NResult {
             n,
             vec: stats(&mut vs),
             jit: stats(&mut js),
+            jitv: stats(&mut jvs),
             e2e_vec: stats(&mut evs),
             e2e_jit: stats(&mut ejs),
+            e2e_jitv: stats(&mut ejvs),
         };
         let xover = crossover(&CostParams {
             t_vec_tuple_ns: res.vec.median,
@@ -499,6 +533,15 @@ fn run_expr(
             res.vec.median / res.jit.median,
             res.e2e_vec.median / 1e6,
             res.e2e_jit.median / 1e6,
+        );
+        println!(
+            "  {:>11} jitv ns/t min {:>8.3} med {:>8.3} | jitv vs jit {:>5.2}x | jitv vs vec {:>5.2}x | e2e jitv {:>10.3} ms",
+            "",
+            res.jitv.min,
+            res.jitv.median,
+            res.jit.median / res.jitv.median,
+            res.vec.median / res.jitv.median,
+            res.e2e_jitv.median / 1e6,
         );
         per_n.push(res);
     }
@@ -523,8 +566,30 @@ fn run_expr(
         eci: e,
         supported,
         tcomp: Some(tc),
+        tcomp_v: Some(tc_v),
         per_n,
     })
+}
+
+/// One line per expression: vector JIT against scalar JIT and eval at the verdict sizes.
+fn vector_summary(results: &[ExprResult]) {
+    println!("\n== Vector JIT (Codegen::Vector) per expression, per-tuple medians");
+    for r in results.iter().filter(|r| r.supported) {
+        let tc_v = r.tcomp_v.map_or(f64::NAN, |t| t.median / 1e3);
+        let tc = r.tcomp.map_or(f64::NAN, |t| t.median / 1e3);
+        let mut line = format!("{:<8} T_comp med us jit {tc:.1} jitv {tc_v:.1}", r.name);
+        for n in [N_VERDICT, N_VERDICT_HI] {
+            if let Some(x) = r.per_n.iter().find(|x| x.n == n) {
+                line += &format!(
+                    " | N={n}: jitv/jit {:.2}x jitv/vec {:.2}x jit/vec {:.2}x",
+                    x.jit.median / x.jitv.median,
+                    x.vec.median / x.jitv.median,
+                    x.vec.median / x.jit.median
+                );
+            }
+        }
+        println!("{line}");
+    }
 }
 
 fn pf(ok: bool) -> &'static str {
@@ -661,6 +726,7 @@ fn main() -> BoxResult<()> {
         results.push(run_expr(name, expr, &sch, &plan, &mut rows)?);
     }
     verdict(&results, opts.quick);
+    vector_summary(&results);
 
     if let Some(path) = &opts.csv {
         write_csv(path, &rows)?;
