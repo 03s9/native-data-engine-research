@@ -595,7 +595,9 @@ fn diff_case(expr: &Expr, kernel: &CompiledKernel, batch: &Batch) -> Result<Outc
 }
 
 /// Minimal repro: the first diverging row, then descend into child subtrees while they still diverge.
+/// Uses the scalar kernel: a one-row batch never enters the vector loop anyway.
 fn minimise(expr: &Expr, batch: &Batch) -> String {
+    let compile = |e: &Expr| compile_with(e, Codegen::Scalar);
     let Ok(kernel) = compile(expr) else {
         return format!("compile failed: {expr:?}");
     };
@@ -719,7 +721,8 @@ fn random_expressions_match_eval_over_seeded_batches() {
         if matches!(expr, Expr::Column { .. } | Expr::Literal(_)) {
             continue;
         }
-        let kernel = match compile(&expr) {
+        // Explicit codegens: `compile` picks one per expression, which would leave the other untested.
+        let kernel = match compile_with(&expr, Codegen::Scalar) {
             Ok(k) => k,
             Err(e) => {
                 stats.divergences.push(format!(

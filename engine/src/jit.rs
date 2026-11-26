@@ -581,8 +581,10 @@ impl CompiledKernel {
     /// `self.out_type` (8 bytes per row for Int64/Float64, 1 byte per row for Boolean).
     fn invoke(&self, ptrs: &[*const u8], n: usize, out: *mut u8) {
         // SAFETY: `run` establishes the contract above (input lengths checked against
-        // `batch.num_rows`, output sized per type). The kernel reads and writes rows 0..n only.
-        // Boolean rows receive only the i8 values 0 or 1 from icmp/fcmp, so each byte is a valid bool.
+        // `batch.num_rows`, output sized per type). The kernel reads and writes rows 0..n only:
+        // the vector loop covers rows below `n & !1` two at a time, the scalar loop the rest.
+        // Boolean rows receive only 0 or 1: scalar icmp/fcmp yield an i8 0/1, and the vector loop
+        // ANDs each lane mask with 1 before its byte store, so each byte is a valid bool.
         unsafe { (self.func)(ptrs.as_ptr(), n, out) };
     }
 }
