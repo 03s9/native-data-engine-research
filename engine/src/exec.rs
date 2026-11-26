@@ -4,6 +4,7 @@ use crate::catalog::Catalog;
 use crate::column::{Batch, Column};
 use crate::eval::{eval, eval_predicate, optimize};
 use crate::expr::Expr;
+use crate::jit::{self, CompiledKernel};
 use crate::join::hash_join;
 use crate::memory::MemoryBudget;
 use crate::plan::LogicalPlan;
@@ -213,11 +214,50 @@ fn project(
         }
     }
     let exprs: Vec<Expr> = exprs.iter().cloned().map(optimize).collect();
+    let total_rows: usize = input.iter().map(|b| b.num_rows).sum();
+    let kernels: Vec<Option<CompiledKernel>> = exprs
+        .iter()
+        .map(|e| {
+            if total_rows < JIT_MIN_ROWS || op_count(e) < JIT_MIN_OPS || !jit::supports(e) {
+                return None;
+            }
+            jit::compile(e).ok()
+        })
+        .collect();
     let morsels = morsels_of(&input, ctx.morsel_rows);
     run_morsels(morsels, ctx.threads, |m| {
-        let columns: Vec<Column> = exprs.iter().map(|e| eval(e, m)).collect::<Result<_>>()?;
+        let columns: Vec<Column> = exprs
+            .iter()
+            .zip(&kernels)
+            .map(|(e, k)| match k {
+                Some(k) => k.run(m),
+                None => eval(e, m),
+            })
+            .collect::<Result<_>>()?;
         Batch::try_new(schema.clone(), columns)
     })
+}
+
+/// Break-even from RESULTS-H1A: below these, compiling costs more than the JIT saves.
+const JIT_MIN_OPS: usize = 7;
+const JIT_MIN_ROWS: usize = 200_000;
+
+/// Number of Binary, Unary and Cast nodes in `e`.
+fn op_count(e: &Expr) -> usize {
+    match e {
+        Expr::Column { .. } | Expr::Literal(_) => 0,
+        Expr::Binary { left, right, .. } => 1 + op_count(left) + op_count(right),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => 1 + op_count(expr),
+        Expr::InList { expr, list, .. } => {
+            op_count(expr) + list.iter().map(op_count).sum::<usize>()
+        }
+        Expr::Case {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => op_count(condition) + op_count(then_expr) + op_count(else_expr),
+    }
 }
 
 fn limit(input: Vec<Batch>, skip: usize, fetch: Option<usize>) -> Vec<Batch> {

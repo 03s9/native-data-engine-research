@@ -907,3 +907,86 @@ fn sort_under_tiny_budget_spills_and_matches_large_budget() {
     assert_eq!(rows(&tiny).len(), N);
     assert_eq!(rows(&tiny), rows(&big));
 }
+
+// ---------- adaptive JIT tier in projection ----------
+
+fn jit_schema() -> SchemaRef {
+    schema(&[
+        ("a", DataType::Int64, true),
+        ("b", DataType::Int64, false),
+        ("k", DataType::Int64, false),
+    ])
+}
+
+fn jit_columns(n: usize) -> Vec<Column> {
+    let a: Vec<Option<i64>> = (0..n)
+        .map(|i| (i % 97 != 0).then_some((i % 1000) as i64))
+        .collect();
+    let b: Vec<i64> = (0..n).map(|i| ((i * 7) % 1000) as i64).collect();
+    let k: Vec<i64> = (0..n).map(|i| ((i * 13) % 11 + 1) as i64).collect();
+    vec![i64_col(&a), Column::from_i64(b), Column::from_i64(k)]
+}
+
+/// Eight Int64 binary operators over the three columns.
+fn eight_ops(sch: &SchemaRef) -> Expr {
+    let mut e = bin(c(sch, "a"), BinaryOp::Add, c(sch, "b"));
+    e = bin(e, BinaryOp::Mul, c(sch, "k"));
+    e = bin(e, BinaryOp::Sub, lit_i(3));
+    e = bin(e, BinaryOp::Add, c(sch, "k"));
+    e = bin(e, BinaryOp::Mul, lit_i(2));
+    e = bin(e, BinaryOp::Add, c(sch, "b"));
+    e = bin(e, BinaryOp::Mul, lit_i(2));
+    bin(e, BinaryOp::Sub, c(sch, "a"))
+}
+
+/// Runs `expr` as a one-column projection over `rows` rows and checks the output against `eval`
+/// applied to each input batch, in order.
+fn check_projection_against_eval(expr: Expr, rows: usize, batch_rows: usize) -> Vec<Batch> {
+    let sch = jit_schema();
+    let cols = jit_columns(rows);
+    let input = batches(&sch, &cols, batch_rows);
+    let expected: Vec<Vec<ScalarValue>> = input
+        .iter()
+        .flat_map(|b| {
+            let out = native_engine::eval::eval(&expr, b).expect("eval runs");
+            (0..out.len()).map(|i| vec![out.get(i)]).collect::<Vec<_>>()
+        })
+        .collect();
+    let out_schema = schema(&[("out", expr.return_type(), true)]);
+    let cat = catalog_with("t", &sch, input);
+    let plan = LogicalPlan::Projection {
+        input: scan("t", &sch),
+        exprs: vec![expr],
+        schema: out_schema,
+    };
+    let actual = execute(&plan, &cat, &ctx(4, 65_536)).expect("projection runs");
+    let actual_rows: Vec<Vec<ScalarValue>> = actual
+        .iter()
+        .flat_map(|b| (0..b.num_rows).map(move |i| b.row(i)))
+        .collect();
+    assert_eq!(actual_rows, expected);
+    actual
+}
+
+#[test]
+fn jit_tier_projection_of_eight_ops_over_250k_rows_matches_eval() {
+    let expr = eight_ops(&jit_schema());
+    let out = check_projection_against_eval(expr, 250_000, 50_000);
+    assert_eq!(out.iter().map(|b| b.num_rows).sum::<usize>(), 250_000);
+}
+
+#[test]
+fn small_projection_of_eight_ops_matches_eval() {
+    let expr = eight_ops(&jit_schema());
+    let out = check_projection_against_eval(expr, 1_000, 300);
+    assert_eq!(out.iter().map(|b| b.num_rows).sum::<usize>(), 1_000);
+}
+
+#[test]
+fn unsupported_division_falls_back_to_eval_and_matches() {
+    let sch = jit_schema();
+    let expr = bin(eight_ops(&sch), BinaryOp::Div, lit_i(7));
+    assert!(!native_engine::jit::supports(&expr));
+    let out = check_projection_against_eval(expr, 250_000, 50_000);
+    assert_eq!(out.iter().map(|b| b.num_rows).sum::<usize>(), 250_000);
+}
