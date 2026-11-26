@@ -1,5 +1,6 @@
 //! Cranelift JIT for arithmetic expressions (experiment H1a, see docs/PLAN.md).
-//! One fused scalar loop per expression: no intermediate columns.
+//! One fused loop per expression, no intermediate columns: scalar (one row per iteration) or,
+//! on aarch64, two rows per iteration in I64X2/F64X2 registers (see `Codegen`, docs/RESULTS-H1A-VEC.md).
 //!
 //! Kernel ABI: `extern "C" fn(cols: *const *const u8, n: usize, out: *mut u8)`.
 //! `cols[k]` points at the values of the k-th referenced column (8 bytes per row),
@@ -300,11 +301,38 @@ impl Gen<'_, '_> {
     }
 }
 
-/// Codegen used by `compile`.
-pub const DEFAULT_CODEGEN: Codegen = Codegen::Scalar;
-
+/// Compiles with the codegen `default_codegen` picks. See `compile_with` to force one.
 pub fn compile(expr: &Expr) -> Result<CompiledKernel> {
-    compile_with(expr, DEFAULT_CODEGEN)
+    check_depth(expr)?; // `default_codegen` recurses too
+    compile_with(expr, default_codegen(expr))
+}
+
+/// Vector unless the expression has an Int64 multiply. aarch64 NEON has no 64-bit lane multiply;
+/// Cranelift emits a 7-instruction sequence per I64X2 `imul`, and with Int64 multiplies the
+/// vector loop lost or tied in docs/RESULTS-H1A-VEC.md, while every other expression gained >1.5x.
+/// Caller must have bounded the depth (`check_depth`).
+fn default_codegen(expr: &Expr) -> Codegen {
+    fn has_int_mul(e: &Expr) -> bool {
+        match e {
+            Expr::Binary {
+                left,
+                op,
+                right,
+                return_type,
+            } => {
+                (*op == BinaryOp::Mul && *return_type == DataType::Int64)
+                    || has_int_mul(left)
+                    || has_int_mul(right)
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => has_int_mul(expr),
+            _ => false,
+        }
+    }
+    if has_int_mul(expr) {
+        Codegen::Scalar
+    } else {
+        Codegen::Vector
+    }
 }
 
 /// Emits one loop iteration's body for `expr` at byte offset `offset` (row `i`) and stores it.
@@ -1158,6 +1186,40 @@ mod tests {
         }
         // Sanity: the same builders with supported operands do compile.
         assert!(supports(&bin(i(), BinaryOp::Add, c(&s, "f"))));
+    }
+
+    #[test]
+    fn compile_vectorizes_unless_there_is_an_int64_multiply() {
+        let (s, _) = setup(vec![
+            ("a", Column::from_i64(vec![1])),
+            ("x", Column::from_f64(vec![1.0])),
+        ]);
+        let vector = [
+            bin(c(&s, "a"), BinaryOp::Add, lit_i(2)),
+            bin(c(&s, "x"), BinaryOp::Mul, c(&s, "x")),
+            // Int64 * Float64 promotes to a Float64 multiply.
+            bin(c(&s, "a"), BinaryOp::Mul, c(&s, "x")),
+            bin(neg(c(&s, "a")), BinaryOp::Lt, c(&s, "a")),
+        ];
+        for e in &vector {
+            assert_eq!(default_codegen(e), Codegen::Vector, "{e:?}");
+        }
+        let scalar = [
+            bin(c(&s, "a"), BinaryOp::Mul, lit_i(2)),
+            neg(bin(c(&s, "a"), BinaryOp::Mul, c(&s, "a"))),
+            bin(
+                cast(
+                    bin(c(&s, "a"), BinaryOp::Mul, c(&s, "a")),
+                    DataType::Float64,
+                )
+                .unwrap(),
+                BinaryOp::Gt,
+                c(&s, "x"),
+            ),
+        ];
+        for e in &scalar {
+            assert_eq!(default_codegen(e), Codegen::Scalar, "{e:?}");
+        }
     }
 
     #[test]

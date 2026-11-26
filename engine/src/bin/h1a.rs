@@ -13,7 +13,7 @@
 //!   dropped inside the region on both sides, so the cost is symmetric.
 //! - Vectorized, scalar-JIT and vector-JIT regions alternate within each iteration.
 //! - "jit" is always `jit::Codegen::Scalar` (the H1a kernel) and "jitv" is `jit::Codegen::Vector`
-//!   (two rows per iteration, I64X2/F64X2), whatever `jit::DEFAULT_CODEGEN` is.
+//!   (two rows per iteration, I64X2/F64X2), whatever `jit::compile` would pick.
 //! - Before any timing, outputs are compared row by row (valid rows; the data has no nulls).
 
 use native_engine::column::{schema_ref, Batch, Column, Values};
