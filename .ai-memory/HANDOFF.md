@@ -1,9 +1,7 @@
-# Handoff — experimento H1a (Cranelift)
-> Último agente: claude-code@2026-11-24
-- Meta: medir se o JIT Cranelift se paga contra o avaliador vetorizado (docs/PLAN.md).
-- Branch: `feat/cranelift-h1a` (sobre `feat/engine-mvp`); ambas locais, NÃO enviadas ao GitHub (push precisa de autorização).
-- Estado: T1–T5 e T7 concluídas. Resultado em `docs/RESULTS-H1A.md`: H1a como escrita não se sustenta; JIT ganha 1,9–2,7x só com ≥ 7 operadores.
-- Testes: `cd engine && cargo test` = 222 unit + 32 e2e + 7 jit_diff + 1 doctest; clippy -D warnings e fmt limpos.
-- CI: `.github/workflows/ci.yml` nunca executou (precisa push). AVX2 e Cranelift em x86 nunca compilados aqui.
-- Pendente: decisão sobre T6 (tier adaptativo) ou JIT vetorial; estouro de pilha em expressões muito profundas.
-- Fora do repo: `~/.gemini/config/mcp_local_ai.py` ganhou `DELEGATE_TIMEOUT_S` e modelos Neon/Hydrogen (não commitado no repo agents-and-skills).
+# Handoff — H1a concluído (Cranelift)
+> Último agente: claude-code@2026-11-26
+- Meta: PLAN.md fechado (T1–T8). Branch `feat/cranelift-h1a`, PR aberto contra main.
+- Feito: T6 (JIT em `project()`: 1 thread, ≥7 ops, ≥200k linhas), guarda de profundidade 128 (eval, jit, executor), JIT vetorial aarch64 (`docs/RESULTS-H1A-VEC.md`), revisão Fable incorporada.
+- Testes: `cd engine && cargo test` = 225 unit + 36 e2e + 7 jit_diff + 1 doctest; clippy -D warnings e fmt limpos.
+- Não verificado: x86/AVX, custo de compilação a frio no executor, causa dos bits de NaN, se o ganho vetorial é SIMD ou só menos iterações.
+- Pendente: desenrolar laço escalar em 2 linhas (isola SIMD); `optimize`/Clone/Drop sem guarda de profundidade; `AdaptiveTier` não usado.

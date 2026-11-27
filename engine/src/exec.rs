@@ -2,7 +2,7 @@
 use crate::aggregate::hash_aggregate;
 use crate::catalog::Catalog;
 use crate::column::{Batch, Column};
-use crate::eval::{eval, eval_predicate, optimize};
+use crate::eval::{check_depth, eval, eval_predicate, optimize};
 use crate::expr::Expr;
 use crate::jit::{self, CompiledKernel};
 use crate::join::hash_join;
@@ -178,6 +178,7 @@ fn filter(input: Vec<Batch>, predicate: &Expr, ctx: &ExecContext) -> Result<Vec<
             predicate.return_type()
         )));
     }
+    check_depth(predicate)?;
     let predicate = optimize(predicate.clone());
     let morsels = morsels_of(&input, ctx.morsel_rows);
     let out = run_morsels(morsels, ctx.threads, |m| {
@@ -213,12 +214,19 @@ fn project(
             )));
         }
     }
+    for e in exprs {
+        check_depth(e)?;
+    }
     let exprs: Vec<Expr> = exprs.iter().cloned().map(optimize).collect();
     let total_rows: usize = input.iter().map(|b| b.num_rows).sum();
     let kernels: Vec<Option<CompiledKernel>> = exprs
         .iter()
         .map(|e| {
-            if total_rows < JIT_MIN_ROWS || op_count(e) < JIT_MIN_OPS || !jit::supports(e) {
+            if ctx.threads != 1
+                || total_rows < JIT_MIN_ROWS
+                || op_count(e) < JIT_MIN_OPS
+                || !jit::supports(e)
+            {
                 return None;
             }
             jit::compile(e).ok()
@@ -238,7 +246,8 @@ fn project(
     })
 }
 
-/// Break-even from RESULTS-H1A: below these, compiling costs more than the JIT saves.
+/// Gate: single thread only (measured 1.16-1.28x at 1 thread, ~1.0x at 4 and 14 threads in `execute`;
+/// review of 2026-11-26). Op/row thresholds are the cold break-even from RESULTS-H1A.
 const JIT_MIN_OPS: usize = 7;
 const JIT_MIN_ROWS: usize = 200_000;
 

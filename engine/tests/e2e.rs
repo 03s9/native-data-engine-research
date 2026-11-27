@@ -959,7 +959,7 @@ fn check_projection_against_eval(expr: Expr, rows: usize, batch_rows: usize) -> 
         exprs: vec![expr],
         schema: out_schema,
     };
-    let actual = execute(&plan, &cat, &ctx(4, 65_536)).expect("projection runs");
+    let actual = execute(&plan, &cat, &ctx(1, 65_536)).expect("projection runs");
     let actual_rows: Vec<Vec<ScalarValue>> = actual
         .iter()
         .flat_map(|b| (0..b.num_rows).map(move |i| b.row(i)))
@@ -989,4 +989,22 @@ fn unsupported_division_falls_back_to_eval_and_matches() {
     assert!(!native_engine::jit::supports(&expr));
     let out = check_projection_against_eval(expr, 250_000, 50_000);
     assert_eq!(out.iter().map(|b| b.num_rows).sum::<usize>(), 250_000);
+}
+
+#[test]
+fn deep_expression_in_executor_is_plan_error_not_abort() {
+    let sch = schema(&[("a", DataType::Int64, false)]);
+    let mut e = col(&sch, "a").unwrap();
+    for _ in 0..1_000 {
+        e = binary(e, BinaryOp::Add, lit(ScalarValue::Int64(1))).unwrap();
+    }
+    let batch = Batch::try_new(sch.clone(), vec![Column::from_i64(vec![1, 2, 3])]).unwrap();
+    let cat = catalog_with("t", &sch, vec![batch]);
+    let plan = LogicalPlan::Projection {
+        input: scan("t", &sch),
+        exprs: vec![e],
+        schema: schema(&[("out", DataType::Int64, false)]),
+    };
+    let err = execute(&plan, &cat, &ctx(1, 1024)).unwrap_err();
+    assert!(matches!(err, EngineError::Plan(_)));
 }

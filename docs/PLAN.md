@@ -39,4 +39,4 @@ Cranelift **0.138**: `load`/`store` recebem `MemFlagsData::trusted()`; usar `ish
 ## Estado (2026-11-26)
 
 T1–T5 e T7 concluídas; resultado em `docs/RESULTS-H1A.md`. T4b (baseline justo do avaliador) foi acrescentada durante a execução.
-T6 feita: `project()` usa JIT com ≥ 7 operadores e ≥ 200k linhas, com fallback para `eval`. T8 (Opus): guarda de profundidade 128 e JIT vetorial (I64X2/F64X2, `docs/RESULTS-H1A-VEC.md`). Revisão independente (Fable) pendente de incorporação. Não medido: ganho ponta a ponta do T6 no executor.
+T6 feita: `project()` usa JIT com ≥ 7 operadores e ≥ 200k linhas, com fallback para `eval`. T8 (Opus): guarda de profundidade 128 e JIT vetorial (I64X2/F64X2, `docs/RESULTS-H1A-VEC.md`). Revisão independente (Fable) incorporada: guarda de profundidade também no executor; JIT no executor só com 1 thread. `AdaptiveTier` (cost.rs) segue sem uso: o gatilho é constante em exec.rs. Não medido: ganho ponta a ponta do T6 no executor.

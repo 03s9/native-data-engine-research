@@ -138,6 +138,6 @@ Ponta a ponta, o JIT ganha em 200k nas mesmas três de antes (`add8`, `arith8`, 
 ## Consequência para o plano
 
 O piso do laço escalar era o gargalo apontado em H1a, e cortá-lo pela metade transforma em ganho por tupla expressões de 3 a 4
-operadores que antes empatavam. O cruzamento ≤ 200k continua sendo o critério que reprova a maioria: a compilação (40–85 µs a quente)
+operadores que antes empatavam. O cruzamento ≤ 200k continua sendo o critério que reprova a maioria: a compilação (36–85 µs a quente)
 pesa tanto quanto o laço. Próximo experimento mais barato: o laço escalar desenrolado em duas linhas, que pode dar o mesmo ganho
-às expressões com `Mul` Int64 e diria quanto do ganho é SIMD. T6 continua pendente da decisão do dono do projeto.
+às expressões com `Mul` Int64 e diria quanto do ganho é SIMD. T6 foi feita (gatilho ≥ 7 operadores, ≥ 200k linhas, só 1 thread: em `execute` com 4 e 14 threads o ganho medido na revisão foi ~1,0x).
