@@ -64,7 +64,7 @@ Há um viés pequeno contra o JIT: a saída dele é zerada antes de ser escrita 
   escrita fora dos limites encontrada.
 - Defeito encontrado na auditoria e corrigido antes destas medições: cada compilação vazava 16 kB de memória executável
   (o `Drop` do cranelift-jit 0.138 não desmapeia as páginas). `CompiledKernel` agora libera no `Drop`; há teste de regressão.
-- Não corrigido: expressões com profundidade na casa dos milhares estouram a pilha em `jit::compile` e em `eval` (o processo aborta).
+- Corrigido depois (commit `2318d3d`): `eval` e `jit::compile` rejeitam expressões com mais de 128 níveis com `EngineError::Plan`. `optimize`, `Clone` e `Drop` ainda recursam sem guarda.
 
 ## Limites
 

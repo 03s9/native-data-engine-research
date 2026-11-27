@@ -26,7 +26,7 @@ Cranelift **0.138**: `load`/`store` recebem `MemFlagsData::trusted()`; usar `ish
 | T3 ✅ | Haiku `jit-diff` | `engine/tests/jit_diff.rs` | Testes diferenciais JIT × `eval` com expressões aleatórias, NULLs, extremos de i64, NaN, lotes de 0/1/8191 linhas | ≥ 2000 casos suportados, 0 divergências | T2 |
 | T4 ✅ | Haiku `jit-bench` | `engine/src/bin/h1a.rs` | Mede `T_comp`, `t_vec`, `t_jit` por tupla em grade de ECI × N; localiza o cruzamento real; grava CSV | roda em release; saídas JIT = eval antes de cronometrar | T1 |
 | T5 ✅ | Fable (orquestrador) | `docs/RESULTS-H1A.md` | Executa T4 pós-merge, aplica benchmark-checklist, veredito por critério de H1a | cada número com método e limite declarado | T2, T3, T4 |
-| T6 ⏸ | Haiku, **condicional** | `engine/src/exec.rs` | Ligar `AdaptiveTier` à projeção (troca vetorizado → JIT) | só se T5 mostrar ganho ≥ 1,3x | T5 |
+| T6 ✅ | Haiku (gatilho por nº de operadores, não ECI) | `engine/src/exec.rs` | Ligar `AdaptiveTier` à projeção (troca vetorizado → JIT) | só se T5 mostrar ganho ≥ 1,3x | T5 |
 | T7 ✅ | Revisor independente (Fable novo + Gemini Argon; Codex só leu `jit.rs`) | somente leitura | Auditoria do `unsafe` do JIT e dos números de T5 | defeitos confirmados corrigidos | T5 |
 
 ## Regras para os agentes
@@ -36,7 +36,7 @@ Cranelift **0.138**: `load`/`store` recebem `MemFlagsData::trusted()`; usar `ish
 - O orquestrador mescla e roda `cargo test`, clippy e fmt antes de aceitar: relatório de agente não é evidência.
 - Duas falhas seguidas no mesmo conserto → parar e pedir segunda opinião (regra anti-loop).
 
-## Estado (2026-11-24)
+## Estado (2026-11-26)
 
 T1–T5 e T7 concluídas; resultado em `docs/RESULTS-H1A.md`. T4b (baseline justo do avaliador) foi acrescentada durante a execução.
-T6 **não iniciada**: o ganho só apareceu com ≥ 7 operadores; decisão pendente do dono do projeto.
+T6 feita: `project()` usa JIT com ≥ 7 operadores e ≥ 200k linhas, com fallback para `eval`. T8 (Opus): guarda de profundidade 128 e JIT vetorial (I64X2/F64X2, `docs/RESULTS-H1A-VEC.md`). Revisão independente (Fable) pendente de incorporação. Não medido: ganho ponta a ponta do T6 no executor.
