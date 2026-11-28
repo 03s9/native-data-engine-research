@@ -1,6 +1,30 @@
-# Motor nativo de dados — Fase 2: endurecimento adversarial da especificação
+# Motor nativo de dados
 
-Este repositório registra a proposta técnica de um motor analítico nativo em **Rust 1.75+**. A Fase 1 formalizou a arquitetura, o modelo de custo e o protocolo de avaliação. A **Fase 2 de revisão adversarial e remediações de baixo nível** foi concluída e aprovada no Gate 2: o crate de verificação passou em **23/23 testes** (`cargo test --offline --locked`). Um **MVP executável** do motor vive em [`engine/`](engine/) (ver abaixo). Há um JIT Cranelift experimental (só expressões aritméticas, fora do executor). LLVM e as suítes TPC-H/ClickBench continuam **fora de escopo**. A RFC permanece em estado *Authoritative Draft*.
+Pesquisa e protótipo de um motor analítico nativo em **Rust**: especificação adversarialmente revisada, um MVP executável e um experimento medido sobre quando um JIT (Cranelift) compensa contra a execução vetorizada.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+## Estado
+
+| Parte | Estado | Onde |
+| --- | --- | --- |
+| Especificação (RFC, arquitetura, modelo de custo, metodologia) | *Authoritative Draft*, revisada na Fase 2 | [`docs/`](docs/) |
+| Harness de verificação | 23/23 testes adversariais | [`verification/`](verification/) |
+| Motor MVP | Executa filtro, projeção, agregação, join e ordenação com spill; sem parser SQL | [`engine/`](engine/) |
+| JIT Cranelift | Experimento H1a concluído: só compensa com ≥ 7 operadores; vetorial (aarch64) 1,5–2x mais rápido que o escalar sem `Mul` Int64 | [RESULTS-H1A](docs/RESULTS-H1A.md), [RESULTS-H1A-VEC](docs/RESULTS-H1A-VEC.md) |
+| LLVM, x86/AVX-512, TPC-H, ClickBench | **Fora de escopo / não feitos**. Medidas são de um único laptop Apple Silicon | — |
+
+## Início rápido
+
+Requer Rust 1.75+.
+
+```bash
+git clone https://github.com/03s9/native-data-engine-research.git
+cd native-data-engine-research/engine
+cargo test                                   # 225 unitários + 36 e2e + 7 diferenciais do JIT + 1 doctest
+cargo run --release --bin ndq -- demo        # 1M linhas: filtro, group-by, join+top5
+cargo run --release --bin h1a -- --csv /tmp/h1a.csv   # reproduz o experimento H1a neste computador
+```
 
 ## Decisões arquiteturais
 
@@ -66,3 +90,7 @@ cargo run --release --bin ndq -- bench    # microbenchmarks de laptop
 ## Próximos marcos
 
 A RFC planeja, após esta revisão adversarial, construir a IR e o runtime básico, integrar compiladores JIT, calibrar o modelo de custo em cada arquitetura e executar auditorias de segurança e benchmarks completos. A “Phase 2” do roteiro de implementação da RFC designa os futuros backends JIT; é distinta desta Fase 2 de revisão. Cada hipótese só deve ser considerada validada quando os critérios e testbeds de [BENCHMARK_METHODOLOGY.md](docs/BENCHMARK_METHODOLOGY.md) forem executados e os resultados forem publicados.
+
+## Licença
+
+[MIT](LICENSE).
