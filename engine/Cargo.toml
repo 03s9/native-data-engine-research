@@ -1,0 +1,29 @@
+[package]
+name = "native_engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Executable MVP of the native analytical data engine specified in docs/"
+
+[dependencies]
+thiserror = "2"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+blake3 = "1"
+cranelift-codegen = "0.138"
+cranelift-frontend = "0.138"
+cranelift-jit = "0.138"
+cranelift-module = "0.138"
+cranelift-native = "0.138"
+
+[dev-dependencies]
+rand = "0.8"
+
+[[bin]]
+name = "ndq"
+path = "src/bin/ndq.rs"
+
+[[bin]]
+name = "h1a"
+path = "src/bin/h1a.rs"

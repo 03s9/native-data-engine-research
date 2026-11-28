@@ -1,0 +1,159 @@
+h1a: H1a measurement (docs/PLAN.md T4). Cranelift JIT vs vectorized eval.
+Scope: expressions jit::supports accepts (Int64/Float64 arithmetic and comparisons); others are skipped. Does NOT address H1b (LLVM), H2 (x86/AVX-512) or H3.
+Machine: arch=aarch64 os=macos logical_cpus=14 | single laptop, single thread for all measured work
+Build: release (debug_assertions off)
+Timer: smallest nonzero Instant gap = 41 ns
+Mode: full | per-tuple runs 9 (+1 warm-up) | e2e runs 5 (+1 warm-up) | T_comp compiles 30 (+1 cold, excluded) | N grid [1000, 10000, 65536, 200000, 1000000, 4000000]
+Allocation: both paths allocate their output per call; eval also allocates one column per intermediate node, the kernel allocates only its output (zeroed).
+Samples: per-tuple = region time / (K*N); K calibrated so a region is about 1 ms (K printed per N). e2e JIT = compile + run + kernel drop per call; e2e vec = eval per call.
+
+== add2  eci=3.0  jit_supported=true
+  first compile (cold, excluded from stats): 3532.6 us
+  T_comp us (30 compiles): min 96.5  median 120.9  p90 213.6
+  N=     1000 K=1143    vec ns/t min    0.150 med    0.166 | jit ns/t min    0.636 med    0.658 | delta_med   -0.492 | speedup  0.25x | model_xover      none | e2e vec      0.000 ms jit      0.044 ms -> vec
+  N=    10000 K=422     vec ns/t min    0.210 med    0.214 | jit ns/t min    0.607 med    0.622 | delta_med   -0.408 | speedup  0.34x | model_xover      none | e2e vec      0.002 ms jit      0.049 ms -> vec
+  N=    65536 K=75      vec ns/t min    0.143 med    0.213 | jit ns/t min    0.553 med    0.580 | delta_med   -0.367 | speedup  0.37x | model_xover      none | e2e vec      0.014 ms jit      0.087 ms -> vec
+  N=   200000 K=25      vec ns/t min    0.143 med    0.209 | jit ns/t min    0.542 med    0.562 | delta_med   -0.353 | speedup  0.37x | model_xover      none | e2e vec      0.040 ms jit      0.156 ms -> vec
+  N=  1000000 K=5       vec ns/t min    0.167 med    0.209 | jit ns/t min    0.551 med    0.575 | delta_med   -0.366 | speedup  0.36x | model_xover      none | e2e vec      0.207 ms jit      0.634 ms -> vec
+  N=  4000000 K=2       vec ns/t min    0.207 med    0.219 | jit ns/t min    0.538 med    0.564 | delta_med   -0.345 | speedup  0.39x | model_xover      none | e2e vec      0.870 ms jit      2.385 ms -> vec
+  empirical crossover (e2e median, runs per point 5): never in grid
+
+== add4  eci=9.0  jit_supported=true
+  first compile (cold, excluded from stats): 96.3 us
+  T_comp us (30 compiles): min 43.6  median 44.6  p90 49.5
+  N=     1000 K=2000    vec ns/t min    0.412 med    0.416 | jit ns/t min    0.655 med    0.667 | delta_med   -0.250 | speedup  0.62x | model_xover      none | e2e vec      0.000 ms jit      0.052 ms -> vec
+  N=    10000 K=137     vec ns/t min    0.540 med    0.687 | jit ns/t min    0.617 med    0.627 | delta_med    0.060 | speedup  1.10x | model_xover    741111 | e2e vec      0.005 ms jit      0.055 ms -> vec
+  N=    65536 K=27      vec ns/t min    0.474 med    0.566 | jit ns/t min    0.572 med    0.599 | delta_med   -0.034 | speedup  0.94x | model_xover      none | e2e vec      0.037 ms jit      0.119 ms -> vec
+  N=   200000 K=8       vec ns/t min    0.512 med    0.627 | jit ns/t min    0.583 med    0.602 | delta_med    0.025 | speedup  1.04x | model_xover   1768573 | e2e vec      0.125 ms jit      0.184 ms -> vec
+  N=  1000000 K=2       vec ns/t min    0.570 med    0.640 | jit ns/t min    0.572 med    0.595 | delta_med    0.045 | speedup  1.08x | model_xover    993959 | e2e vec      0.634 ms jit      0.746 ms -> vec
+  N=  4000000 K=1       vec ns/t min    0.590 med    0.649 | jit ns/t min    0.589 med    0.604 | delta_med    0.045 | speedup  1.07x | model_xover    986405 | e2e vec      2.567 ms jit      2.635 ms -> vec
+  empirical crossover (e2e median, runs per point 5): never in grid
+
+== add8  eci=21.0  jit_supported=true
+  first compile (cold, excluded from stats): 172.8 us
+  T_comp us (30 compiles): min 51.0  median 52.0  p90 56.4
+  N=     1000 K=1201    vec ns/t min    0.951 med    0.972 | jit ns/t min    0.656 med    0.677 | delta_med    0.295 | speedup  1.44x | model_xover    176368 | e2e vec      0.001 ms jit      0.060 ms -> vec
+  N=    10000 K=132     vec ns/t min    1.582 med    1.609 | jit ns/t min    0.635 med    0.653 | delta_med    0.957 | speedup  2.47x | model_xover     54332 | e2e vec      0.016 ms jit      0.073 ms -> vec
+  N=    65536 K=22      vec ns/t min    1.160 med    1.215 | jit ns/t min    0.605 med    0.657 | delta_med    0.558 | speedup  1.85x | model_xover     93117 | e2e vec      0.087 ms jit      0.102 ms -> vec
+  N=   200000 K=8       vec ns/t min    1.427 med    1.461 | jit ns/t min    0.630 med    0.638 | delta_med    0.822 | speedup  2.29x | model_xover     63201 | e2e vec      0.294 ms jit      0.203 ms -> jit
+  N=  1000000 K=2       vec ns/t min    1.429 med    1.484 | jit ns/t min    0.617 med    0.632 | delta_med    0.852 | speedup  2.35x | model_xover     60988 | e2e vec      1.493 ms jit      0.774 ms -> jit
+  N=  4000000 K=1       vec ns/t min    1.487 med    1.520 | jit ns/t min    0.608 med    0.636 | delta_med    0.884 | speedup  2.39x | model_xover     58818 | e2e vec      6.017 ms jit      3.002 ms -> jit
+  empirical crossover (e2e median, runs per point 5): N=200000
+
+== arith4  eci=10.0  jit_supported=true
+  first compile (cold, excluded from stats): 191.4 us
+  T_comp us (30 compiles): min 43.9  median 44.8  p90 49.9
+  N=     1000 K=1263    vec ns/t min    0.746 med    0.763 | jit ns/t min    0.657 med    0.671 | delta_med    0.092 | speedup  1.14x | model_xover    485348 | e2e vec      0.001 ms jit      0.056 ms -> vec
+  N=    10000 K=138     vec ns/t min    0.870 med    0.910 | jit ns/t min    0.596 med    0.629 | delta_med    0.281 | speedup  1.45x | model_xover    159355 | e2e vec      0.009 ms jit      0.062 ms -> vec
+  N=    65536 K=24      vec ns/t min    0.825 med    0.852 | jit ns/t min    0.583 med    0.606 | delta_med    0.245 | speedup  1.41x | model_xover    182626 | e2e vec      0.055 ms jit      0.098 ms -> vec
+  N=   200000 K=8       vec ns/t min    0.880 med    0.900 | jit ns/t min    0.591 med    0.606 | delta_med    0.294 | speedup  1.48x | model_xover    152704 | e2e vec      0.182 ms jit      0.184 ms -> vec
+  N=  1000000 K=2       vec ns/t min    0.879 med    0.896 | jit ns/t min    0.584 med    0.597 | delta_med    0.300 | speedup  1.50x | model_xover    149568 | e2e vec      0.902 ms jit      0.723 ms -> jit
+  N=  4000000 K=1       vec ns/t min    0.876 med    0.907 | jit ns/t min    0.516 med    0.600 | delta_med    0.307 | speedup  1.51x | model_xover    146165 | e2e vec      3.564 ms jit      2.493 ms -> jit
+  empirical crossover (e2e median, runs per point 5): N=1000000
+
+== arith8  eci=18.0  jit_supported=true
+  first compile (cold, excluded from stats): 105.0 us
+  T_comp us (30 compiles): min 51.5  median 53.9  p90 91.9
+  N=     1000 K=1265    vec ns/t min    1.442 med    1.487 | jit ns/t min    0.650 med    0.663 | delta_med    0.824 | speedup  2.24x | model_xover     65471 | e2e vec      0.002 ms jit      0.064 ms -> vec
+  N=    10000 K=127     vec ns/t min    1.797 med    1.936 | jit ns/t min    0.659 med    0.698 | delta_med    1.239 | speedup  2.78x | model_xover     43540 | e2e vec      0.018 ms jit      0.068 ms -> vec
+  N=    65536 K=21      vec ns/t min    1.692 med    1.725 | jit ns/t min    0.652 med    0.657 | delta_med    1.068 | speedup  2.63x | model_xover     50497 | e2e vec      0.113 ms jit      0.114 ms -> vec
+  N=   200000 K=7       vec ns/t min    1.653 med    1.803 | jit ns/t min    0.656 med    0.667 | delta_med    1.137 | speedup  2.70x | model_xover     47454 | e2e vec      0.340 ms jit      0.215 ms -> jit
+  N=  1000000 K=2       vec ns/t min    1.760 med    1.836 | jit ns/t min    0.636 med    0.685 | delta_med    1.151 | speedup  2.68x | model_xover     46880 | e2e vec      1.841 ms jit      0.832 ms -> jit
+  N=  4000000 K=1       vec ns/t min    1.778 med    1.838 | jit ns/t min    0.663 med    0.690 | delta_med    1.148 | speedup  2.66x | model_xover     46974 | e2e vec      7.464 ms jit      2.893 ms -> jit
+  empirical crossover (e2e median, runs per point 5): N=200000
+
+== float4  eci=7.0  jit_supported=true
+  first compile (cold, excluded from stats): 121.9 us
+  T_comp us (30 compiles): min 38.5  median 42.1  p90 53.6
+  N=     1000 K=1500    vec ns/t min    0.416 med    0.441 | jit ns/t min    0.612 med    0.647 | delta_med   -0.206 | speedup  0.68x | model_xover      none | e2e vec      0.000 ms jit      0.050 ms -> vec
+  N=    10000 K=166     vec ns/t min    0.616 med    0.647 | jit ns/t min    0.578 med    0.591 | delta_med    0.056 | speedup  1.09x | model_xover    754919 | e2e vec      0.005 ms jit      0.052 ms -> vec
+  N=    65536 K=28      vec ns/t min    0.498 med    0.534 | jit ns/t min    0.538 med    0.555 | delta_med   -0.020 | speedup  0.96x | model_xover      none | e2e vec      0.034 ms jit      0.087 ms -> vec
+  N=   200000 K=9       vec ns/t min    0.610 med    0.642 | jit ns/t min    0.551 med    0.559 | delta_med    0.083 | speedup  1.15x | model_xover    504264 | e2e vec      0.129 ms jit      0.170 ms -> vec
+  N=  1000000 K=2       vec ns/t min    0.545 med    0.636 | jit ns/t min    0.491 med    0.547 | delta_med    0.089 | speedup  1.16x | model_xover    473521 | e2e vec      0.629 ms jit      0.652 ms -> vec
+  N=  4000000 K=1       vec ns/t min    0.611 med    0.653 | jit ns/t min    0.496 med    0.540 | delta_med    0.113 | speedup  1.21x | model_xover    372637 | e2e vec      2.617 ms jit      2.367 ms -> jit
+  empirical crossover (e2e median, runs per point 5): N=4000000
+
+== float8  eci=15.0  jit_supported=true
+  first compile (cold, excluded from stats): 106.7 us
+  T_comp us (30 compiles): min 43.2  median 46.4  p90 48.5
+  N=     1000 K=1500    vec ns/t min    0.921 med    0.964 | jit ns/t min    0.640 med    0.683 | delta_med    0.281 | speedup  1.41x | model_xover    164922 | e2e vec      0.001 ms jit      0.058 ms -> vec
+  N=    10000 K=139     vec ns/t min    1.267 med    1.462 | jit ns/t min    0.576 med    0.582 | delta_med    0.880 | speedup  2.51x | model_xover     52726 | e2e vec      0.014 ms jit      0.065 ms -> vec
+  N=    65536 K=25      vec ns/t min    1.151 med    1.245 | jit ns/t min    0.530 med    0.575 | delta_med    0.670 | speedup  2.17x | model_xover     69197 | e2e vec      0.086 ms jit      0.102 ms -> vec
+  N=   200000 K=9       vec ns/t min    1.059 med    1.304 | jit ns/t min    0.540 med    0.567 | delta_med    0.736 | speedup  2.30x | model_xover     62973 | e2e vec      0.272 ms jit      0.184 ms -> jit
+  N=  1000000 K=2       vec ns/t min    1.236 med    1.358 | jit ns/t min    0.508 med    0.541 | delta_med    0.817 | speedup  2.51x | model_xover     56772 | e2e vec      1.347 ms jit      0.670 ms -> jit
+  N=  4000000 K=1       vec ns/t min    1.317 med    1.322 | jit ns/t min    0.537 med    0.548 | delta_med    0.774 | speedup  2.41x | model_xover     59933 | e2e vec      5.303 ms jit      2.367 ms -> jit
+  empirical crossover (e2e median, runs per point 5): N=200000
+
+== mixed  eci=10.5  jit_supported=true
+  first compile (cold, excluded from stats): 89.5 us
+  T_comp us (30 compiles): min 39.3  median 40.4  p90 43.3
+  N=     1000 K=1600    vec ns/t min    0.364 med    0.371 | jit ns/t min    0.616 med    0.631 | delta_med   -0.260 | speedup  0.59x | model_xover      none | e2e vec      0.000 ms jit      0.053 ms -> vec
+  N=    10000 K=162     vec ns/t min    0.588 med    0.603 | jit ns/t min    0.595 med    0.610 | delta_med   -0.007 | speedup  0.99x | model_xover      none | e2e vec      0.006 ms jit      0.061 ms -> vec
+  N=    65536 K=25      vec ns/t min    0.401 med    0.467 | jit ns/t min    0.573 med    0.618 | delta_med   -0.151 | speedup  0.76x | model_xover      none | e2e vec      0.034 ms jit      0.100 ms -> vec
+  N=   200000 K=10      vec ns/t min    0.388 med    0.563 | jit ns/t min    0.541 med    0.570 | delta_med   -0.008 | speedup  0.99x | model_xover      none | e2e vec      0.106 ms jit      0.186 ms -> vec
+  N=  1000000 K=2       vec ns/t min    0.493 med    0.575 | jit ns/t min    0.535 med    0.557 | delta_med    0.018 | speedup  1.03x | model_xover   2255854 | e2e vec      0.566 ms jit      0.725 ms -> vec
+  N=  4000000 K=1       vec ns/t min    0.529 med    0.585 | jit ns/t min    0.532 med    0.565 | delta_med    0.020 | speedup  1.03x | model_xover   2045343 | e2e vec      2.294 ms jit      2.524 ms -> vec
+  empirical crossover (e2e median, runs per point 5): never in grid
+
+== cmp  eci=10.0  jit_supported=true
+  first compile (cold, excluded from stats): 129.4 us
+  T_comp us (30 compiles): min 44.2  median 45.4  p90 49.9
+  N=     1000 K=1600    vec ns/t min    0.746 med    0.780 | jit ns/t min    0.583 med    0.605 | delta_med    0.174 | speedup  1.29x | model_xover    260371 | e2e vec      0.001 ms jit      0.060 ms -> vec
+  N=    10000 K=174     vec ns/t min    0.898 med    0.951 | jit ns/t min    0.568 med    0.580 | delta_med    0.372 | speedup  1.64x | model_xover    122068 | e2e vec      0.009 ms jit      0.068 ms -> vec
+  N=    65536 K=28      vec ns/t min    0.742 med    0.899 | jit ns/t min    0.527 med    0.592 | delta_med    0.307 | speedup  1.52x | model_xover    147817 | e2e vec      0.060 ms jit      0.111 ms -> vec
+  N=   200000 K=9       vec ns/t min    0.808 med    0.843 | jit ns/t min    0.556 med    0.578 | delta_med    0.265 | speedup  1.46x | model_xover    171452 | e2e vec      0.167 ms jit      0.184 ms -> vec
+  N=  1000000 K=2       vec ns/t min    0.786 med    0.845 | jit ns/t min    0.556 med    0.576 | delta_med    0.269 | speedup  1.47x | model_xover    168537 | e2e vec      0.891 ms jit      0.736 ms -> jit
+  N=  4000000 K=1       vec ns/t min    0.831 med    0.842 | jit ns/t min    0.551 med    0.575 | delta_med    0.266 | speedup  1.46x | model_xover    170390 | e2e vec      3.417 ms jit      2.536 ms -> jit
+  empirical crossover (e2e median, runs per point 5): N=1000000
+
+== H1a criteria per expression (eci >= 4); no overall verdict is printed
+
+add4 (eci=9.0)
+  T_comp median <= 1.5 ms: PASS (0.045 ms)
+  model crossover <= 200000 (rates at N=200000): FAIL (1768573 tuples)
+  speedup >= 1.3 at N=200000: FAIL (1.04x)
+  speedup >= 1.3 at N=1000000: FAIL (1.08x)
+
+add8 (eci=21.0)
+  T_comp median <= 1.5 ms: PASS (0.052 ms)
+  model crossover <= 200000 (rates at N=200000): PASS (63201 tuples)
+  speedup >= 1.3 at N=200000: PASS (2.29x)
+  speedup >= 1.3 at N=1000000: PASS (2.35x)
+
+arith4 (eci=10.0)
+  T_comp median <= 1.5 ms: PASS (0.045 ms)
+  model crossover <= 200000 (rates at N=200000): PASS (152704 tuples)
+  speedup >= 1.3 at N=200000: PASS (1.48x)
+  speedup >= 1.3 at N=1000000: PASS (1.50x)
+
+arith8 (eci=18.0)
+  T_comp median <= 1.5 ms: PASS (0.054 ms)
+  model crossover <= 200000 (rates at N=200000): PASS (47454 tuples)
+  speedup >= 1.3 at N=200000: PASS (2.70x)
+  speedup >= 1.3 at N=1000000: PASS (2.68x)
+
+float4 (eci=7.0)
+  T_comp median <= 1.5 ms: PASS (0.042 ms)
+  model crossover <= 200000 (rates at N=200000): FAIL (504264 tuples)
+  speedup >= 1.3 at N=200000: FAIL (1.15x)
+  speedup >= 1.3 at N=1000000: FAIL (1.16x)
+
+float8 (eci=15.0)
+  T_comp median <= 1.5 ms: PASS (0.046 ms)
+  model crossover <= 200000 (rates at N=200000): PASS (62973 tuples)
+  speedup >= 1.3 at N=200000: PASS (2.30x)
+  speedup >= 1.3 at N=1000000: PASS (2.51x)
+
+mixed (eci=10.5)
+  T_comp median <= 1.5 ms: PASS (0.040 ms)
+  model crossover <= 200000 (rates at N=200000): FAIL (no crossover (delta <= 0))
+  speedup >= 1.3 at N=200000: FAIL (0.99x)
+  speedup >= 1.3 at N=1000000: FAIL (1.03x)
+
+cmp (eci=10.0)
+  T_comp median <= 1.5 ms: PASS (0.045 ms)
+  model crossover <= 200000 (rates at N=200000): PASS (171452 tuples)
+  speedup >= 1.3 at N=200000: PASS (1.46x)
+  speedup >= 1.3 at N=1000000: PASS (1.47x)
+
+wrote 2052 raw rows to ../docs/results/h1a-run1.csv
